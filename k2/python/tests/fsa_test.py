@@ -14,6 +14,7 @@ import unittest
 import torch
 import _k2  # for test only, users should not import it.
 import k2
+import os
 
 
 def _remove_leading_spaces(s: str) -> str:
@@ -24,16 +25,15 @@ def _remove_leading_spaces(s: str) -> str:
 class TestFsa(unittest.TestCase):
 
     def test_acceptor_from_tensor(self):
-        fsa_tensor = torch.tensor(
-            [[0, 1, 2, _k2._float_as_int(-1.2)],
-             [0, 2, 10, _k2._float_as_int(-2.2)],
-             [1, 6, -1, _k2._float_as_int(-3.2)],
-             [1, 3, 3, _k2._float_as_int(-4.2)],
-             [2, 6, -1, _k2._float_as_int(-5.2)],
-             [2, 4, 2, _k2._float_as_int(-6.2)],
-             [3, 6, -1, _k2._float_as_int(-7.2)],
-             [5, 0, 1, _k2._float_as_int(-8.2)]],
-            dtype=torch.int32)
+        fsa_tensor = torch.tensor([[0, 1, 2, _k2.float_as_int(-1.2)],
+                                   [0, 2, 10, _k2.float_as_int(-2.2)],
+                                   [1, 6, -1, _k2.float_as_int(-3.2)],
+                                   [1, 3, 3, _k2.float_as_int(-4.2)],
+                                   [2, 6, -1, _k2.float_as_int(-5.2)],
+                                   [2, 4, 2, _k2.float_as_int(-6.2)],
+                                   [3, 6, -1, _k2.float_as_int(-7.2)],
+                                   [5, 0, 1, _k2.float_as_int(-8.2)]],
+                                  dtype=torch.int32)
 
         fsa = k2.Fsa(fsa_tensor)
 
@@ -180,14 +180,14 @@ class TestFsa(unittest.TestCase):
 
         for device in devices:
             fsa_tensor = torch.tensor(
-                [[0, 1, 2, _k2._float_as_int(-1.2)],
-                 [0, 2, 10, _k2._float_as_int(-2.2)],
-                 [1, 6, -1, _k2._float_as_int(-4.2)],
-                 [1, 3, 3, _k2._float_as_int(-3.2)],
-                 [2, 6, -1, _k2._float_as_int(-5.2)],
-                 [2, 4, 2, _k2._float_as_int(-6.2)],
-                 [3, 6, -1, _k2._float_as_int(-7.2)],
-                 [5, 0, 1, _k2._float_as_int(-8.2)]],
+                [[0, 1, 2, _k2.float_as_int(-1.2)],
+                 [0, 2, 10, _k2.float_as_int(-2.2)],
+                 [1, 6, -1, _k2.float_as_int(-4.2)],
+                 [1, 3, 3, _k2.float_as_int(-3.2)],
+                 [2, 6, -1, _k2.float_as_int(-5.2)],
+                 [2, 4, 2, _k2.float_as_int(-6.2)],
+                 [3, 6, -1, _k2.float_as_int(-7.2)],
+                 [5, 0, 1, _k2.float_as_int(-8.2)]],
                 dtype=torch.int32).to(device)
             aux_labels_tensor = torch.tensor([22, 100, 16, 33, 26, 22, 36, 50],
                                              dtype=torch.int32).to(device)
@@ -309,7 +309,7 @@ class TestFsa(unittest.TestCase):
 
         # now test vector of FSAs
 
-        ragged_arc = _k2._fsa_to_fsa_vec(fsa.arcs)
+        ragged_arc = _k2.fsa_to_fsa_vec(fsa.arcs)
         del fsa
         fsa_vec = k2.Fsa(ragged_arc)
         del ragged_arc
@@ -364,17 +364,9 @@ class TestFsa(unittest.TestCase):
         fsa = k2.Fsa.from_str(_remove_leading_spaces(rules))
         fsa.symbols = symbols
         fsa.aux_symbols = aux_symbols
-        dot = k2.to_dot(fsa)
 
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            dot.render(filename='fsa',
-                       directory=tmp_dir,
-                       format='pdf',
-                       cleanup=True)
-            # the fsa is saved to tmp_dir/fsa.pdf
-            import os
-            os.system('ls -l {}/fsa.pdf'.format(tmp_dir))
+        fsa.draw(filename='foo.png')
+        os.remove('foo.png')
 
     def test_to(self):
         s = '''
@@ -385,15 +377,11 @@ class TestFsa(unittest.TestCase):
         assert fsa.is_cpu()
 
         if torch.cuda.is_available():
-            device = torch.device('cuda', 0)
-            fsa = fsa.to(device)
+            fsa = fsa.to('cuda:0')
             assert fsa.is_cuda()
-            assert fsa.device == device
 
-        device = torch.device('cpu')
-        fsa = fsa.to(device)
+        fsa = fsa.to('cpu')
         assert fsa.is_cpu()
-        assert fsa.device == device
 
     def test_getitem(self):
         s0 = '''
@@ -416,6 +404,7 @@ class TestFsa(unittest.TestCase):
         assert new_fsa0.shape == (4, None)  # it has 4 states
 
         scale = torch.arange(new_fsa0.scores.numel())
+
         (new_fsa0.scores * scale).sum().backward()
         assert torch.allclose(fsa0.scores.grad, torch.tensor([0., 1., 2.]))
 
@@ -462,6 +451,175 @@ class TestFsa(unittest.TestCase):
         assert str(fsa0) == str(fsa1)
         fsa1.invert_()
         assert str(fsa0) != str(fsa1)
+
+    def test_single_fsa_as_dict(self):
+        s = '''
+            0 1 1 10 0.1
+            1 2 -1 -1 0.2
+            2
+        '''
+
+        sym_str = '''
+            a 1
+        '''
+        symbol_table = k2.SymbolTable.from_str(sym_str)
+        fsa = k2.Fsa.from_str(s)
+        fsa.symbols = symbol_table
+        del symbol_table
+
+        fsa.tensor_attr1 = torch.tensor([1, 2])
+        fsa.tensor_attr2 = torch.tensor([[10, 20], [30, 40.]])
+        fsa.non_tensor_attr1 = 'test-fsa'
+        fsa.non_tensor_attr2 = 20201208
+
+        fsa_dict = fsa.as_dict()
+        del fsa
+
+        fsa = k2.Fsa.from_dict(fsa_dict)
+        assert torch.all(torch.eq(fsa.tensor_attr1, torch.tensor([1, 2])))
+        assert torch.all(
+            torch.eq(fsa.tensor_attr2, torch.tensor([[10, 20], [30, 40]])))
+        assert fsa.non_tensor_attr1 == 'test-fsa'
+        assert fsa.non_tensor_attr2 == 20201208
+        assert fsa.symbols.get('a') == 1
+        assert fsa.symbols.get(1) == 'a'
+
+    def test_fsa_vec_as_dict(self):
+        s1 = '''
+            0 1 1 10 0.1
+            1 2 -1 -1 0.2
+            2
+        '''
+        s2 = '''
+            0 1 -1 30 0.3
+            1
+        '''
+        fsa1 = k2.Fsa.from_str(s1)
+        fsa2 = k2.Fsa.from_str(s2)
+        fsa = k2.create_fsa_vec([fsa1, fsa2])
+        del fsa1, fsa2
+
+        sym_str = '''
+            a 1
+        '''
+        symbol_table = k2.SymbolTable.from_str(sym_str)
+        fsa.symbols = symbol_table
+        del symbol_table
+
+        fsa.tensor_attr1 = torch.tensor([1, 2, 3])
+        fsa.tensor_attr2 = torch.tensor([[10, 20], [30, 40.], [50, 60]])
+        fsa.non_tensor_attr1 = 'test-fsa-vec'
+        fsa.non_tensor_attr2 = 20201208
+
+        fsa_dict = fsa.as_dict()
+        del fsa
+
+        fsa = k2.Fsa.from_dict(fsa_dict)
+        assert fsa.shape == (2, None, None)
+        assert torch.all(torch.eq(fsa.tensor_attr1, torch.tensor([1, 2, 3])))
+        assert torch.all(
+            torch.eq(fsa.tensor_attr2,
+                     torch.tensor([[10, 20], [30, 40], [50, 60]])))
+        assert fsa.non_tensor_attr1 == 'test-fsa-vec'
+        assert fsa.non_tensor_attr2 == 20201208
+        assert fsa.symbols.get('a') == 1
+        assert fsa.symbols.get(1) == 'a'
+
+    def test_fsa_vec_as_dict_ragged(self):
+        r = k2.RaggedInt(k2.RaggedShape('[ [ x x ] [x] [ x x ] [x]]'),
+                         torch.tensor([3, 4, 5, 6, 7, 8], dtype=torch.int32))
+        g = k2.Fsa.from_str('0  1  3  0.0\n  1 2 -1 0.0\n  2')
+        h = k2.create_fsa_vec([g, g])
+        h.aux_labels = r
+        assert (h[0].aux_labels.dim0() == h[0].labels.shape[0])
+
+    def test_set_scores_stochastic(self):
+        s = '''
+            0 1 1 0.
+            0 1 2 0.
+            1 2 3 0.
+            1 2 4 0.
+            1 2 5 0.
+            2 3 -1 0.
+            3
+        '''
+        fsa = k2.Fsa.from_str(s)
+        scores = torch.randn_like(fsa.scores)
+        fsa.set_scores_stochastic_(scores)
+
+        # scores of state 0 should be normalized
+        assert torch.allclose(fsa.scores[0:2].exp().sum(), torch.Tensor([1]))
+
+        # scores of state 1 should be normalized
+        assert torch.allclose(fsa.scores[2:5].exp().sum(), torch.Tensor([1]))
+
+        # scores of state 2 should be normalized
+        assert torch.allclose(fsa.scores[5].exp().sum(), torch.Tensor([1]))
+
+    def test_scores_autograd(self):
+        s = '''
+            0 1 -1 100
+            1
+        '''
+        fsa = k2.Fsa.from_str(s)
+        fsa.requires_grad_(True)
+        s = 8 * fsa.scores
+        s.sum().backward()
+        assert fsa.grad == 8
+
+        import torch.optim as optim
+        optimizer = optim.SGD([{'params': [fsa.scores]}], lr=0.25)
+        optimizer.step()
+
+        assert fsa.scores.item() == 98
+        assert _k2.as_float(fsa.arcs.values()[:, -1]) == 98
+
+    def test_scores_autograd_with_assignment(self):
+        s = '''
+            0 1 -1 10.
+            1
+        '''
+        fsa = k2.Fsa.from_str(s)
+        assert fsa.requires_grad_(False)
+
+        scores = torch.tensor([100.], dtype=torch.float32, requires_grad=True)
+
+        import torch.optim as optim
+        optimizer = optim.SGD([{'params': [scores]}], lr=0.25)
+
+        # CAUTION: we use [:] here
+        fsa.scores[:] = scores
+
+        assert fsa.requires_grad is True
+        (fsa.scores * 8).sum().backward()
+
+        assert scores.grad == 8
+
+        optimizer.step()
+
+        assert fsa.scores.item() == 100, f'fsa.scores is {fsa.scores}'
+        assert scores.item() == 98
+
+        # CAUTION: had we used fsa.scores = scores,
+        # would we have `fsa.scores != fsa.arcs.values()[:, -1]`.
+        # That is, `fsa.scores` shares memory with `scores`,
+        # but not with fsa.arcs.values!
+        assert _k2.as_float(fsa.arcs.values()[:, -1]).item() == 100
+
+    def test_detach(self):
+        s = '''
+            0 1 -1 10.0
+            1
+        '''
+        fsa = k2.Fsa.from_str(s)
+        fsa.requires_grad_(True)
+
+        detached = fsa.detach()
+        assert detached.requires_grad is False
+        assert fsa.requires_grad is True
+
+        # the underlying memory is shared!
+        assert detached.scores.data_ptr() == fsa.scores.data_ptr()
 
 
 if __name__ == '__main__':

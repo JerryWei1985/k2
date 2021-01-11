@@ -23,13 +23,17 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <memory>
 #include <random>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "cub/cub.cuh"
+#include "k2/csrc/macros.h"
+#include "k2/csrc/moderngpu_allocator.h"
 #include "k2/csrc/utils.h"
+#include "moderngpu/kernel_mergesort.hxx"
 
 namespace k2 {
 namespace internal {
@@ -129,7 +133,7 @@ __global__ void TransposeKernel(int32_t rows, int32_t cols,
 // to compute exclusive sum for each row
 template <typename T>
 void ExclusiveSumPerRow(const Array2<T> &src, Array2<T> *dest) {
-  NVTX_RANGE("ExclusiveSumPerRow");
+  NVTX_RANGE(K2_FUNC);
   int32_t rows = dest->Dim0();
   // note there may be dest->Dim1() == src.Dim1() + 1
   int32_t cols = dest->Dim1();
@@ -146,9 +150,10 @@ void ExclusiveSumPerRow(const Array2<T> &src, Array2<T> *dest) {
 template <typename T, typename std::enable_if<std::is_floating_point<T>::value,
                                               T>::type * = nullptr>
 void RandArray1Internal(ContextPtr &c, int32_t dim, T min_value, T max_value,
-                        T *data) {
+                        T *data, int32_t seed = 0) {
   std::random_device rd;
   std::mt19937 gen(rd());
+  if (seed != 0) gen = std::mt19937(seed);
   std::uniform_real_distribution<T> dis(min_value, max_value);
   for (int32_t i = 0; i < dim; ++i) data[i] = dis(gen);
 }
@@ -156,9 +161,10 @@ void RandArray1Internal(ContextPtr &c, int32_t dim, T min_value, T max_value,
 template <typename T, typename std::enable_if<std::is_integral<T>::value,
                                               T>::type * = nullptr>
 void RandArray1Internal(ContextPtr &c, int32_t dim, T min_value, T max_value,
-                        T *data) {
+                        T *data, int32_t seed = 0) {
   std::random_device rd;
   std::mt19937 gen(rd());
+  if (seed != 0) gen = std::mt19937(seed);
   // TODO(haowen): uniform_int_distribution does not support bool and char,
   // we may need to add some check here?
   std::uniform_int_distribution<T> dis(min_value, max_value);
@@ -188,7 +194,7 @@ struct iterator_traits<k2::internal::ReversedPtr<T>> {
 namespace k2 {
 template <typename T>
 void Transpose(ContextPtr &c, const Array2<T> &src, Array2<T> *dest) {
-  NVTX_RANGE("Transpose");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK(c->IsCompatible(*src.Context()));
   K2_CHECK(c->IsCompatible(*dest->Context()));
   int32_t rows = src.Dim0();
@@ -224,7 +230,7 @@ void Transpose(ContextPtr &c, const Array2<T> &src, Array2<T> *dest) {
 
 template <typename T>
 void ExclusiveSumDeref(Array1<const T *> &src, Array1<T> *dest) {
-  NVTX_RANGE("ExclusiveSumDeref");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK(IsCompatible(src, *dest));
   int32_t src_dim = src.Dim();
   int32_t dest_dim = dest->Dim();
@@ -240,7 +246,7 @@ void ExclusiveSumDeref(Array1<const T *> &src, Array1<T> *dest) {
 
 template <typename T>
 void ExclusiveSum(const Array2<T> &src, Array2<T> *dest, int32_t axis) {
-  NVTX_RANGE("ExclusiveSum");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK(axis == 0 || axis == 1);
   K2_CHECK(IsCompatible(src, *dest));
   int32_t src_major_dim = src.Dim0();  // the axis will be summed
@@ -286,7 +292,7 @@ void ExclusiveSum(const Array2<T> &src, Array2<T> *dest, int32_t axis) {
 // Splice() in array_ops.cu, since it was modified from this code.
 template <typename T>
 Array1<T> Append(int32_t num_arrays, const Array1<T> **src) {
-  NVTX_RANGE("Append1");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK_GT(num_arrays, 0);
   ContextPtr &c = src[0]->Context();
 
@@ -332,16 +338,16 @@ Array1<T> Append(int32_t num_arrays, const Array1<T> **src) {
       // elements being processed is small. What we're saying is that the
       // arrays' sizes are fairly balanced, so we launch with a simple
       // rectangular kernel.
-      auto lambda_set_data = [=] __host__ __device__(int32_t i,
-                                                     int32_t j) -> void {
-        int32_t row_start = row_splits_data[i],
-                row_end = row_splits_data[i + 1];
-        const T *src_ptr = src_ptrs_data[i];
-        if (j < row_end - row_start) {
-          ans_data[row_start + j] = src_ptr[j];
-        }
-      };
-      Eval2(c, num_arrays, max_dim, lambda_set_data);
+      K2_EVAL2(
+          c, num_arrays, max_dim, lambda_set_data,
+          (int32_t i, int32_t j)->void {
+            int32_t row_start = row_splits_data[i],
+                    row_end = row_splits_data[i + 1];
+            const T *src_ptr = src_ptrs_data[i];
+            if (j < row_end - row_start) {
+              ans_data[row_start + j] = src_ptr[j];
+            }
+          });
     } else {
       int32_t block_dim = 256;
       while (block_dim * 4 < avg_input_size && block_dim < 8192) block_dim *= 2;
@@ -368,20 +374,20 @@ Array1<T> Append(int32_t num_arrays, const Array1<T> **src) {
       Array1<uint64_t> index_map_gpu(c, index_map);
       const uint64_t *index_map_data = index_map_gpu.Data();
 
-      auto lambda_set_data_blocks = [=] __host__ __device__(int32_t i,
-                                                            int32_t j) {
-        uint64_t index = index_map_data[i];
-        uint32_t orig_i = static_cast<uint32_t>(index),
-                 block_index = static_cast<uint32_t>(index >> 32);
-        int32_t row_start = row_splits_data[orig_i],
-                row_end = row_splits_data[orig_i + 1],
-                orig_j = (block_index * block_dim) + j;
-        const T *src_ptr = src_ptrs_data[orig_i];
-        if (orig_j < row_end - row_start) {
-          ans_data[row_start + orig_j] = src_ptr[orig_j];
-        }
-      };
-      Eval2(c, index_map_gpu.Dim(), block_dim, lambda_set_data_blocks);
+      K2_EVAL2(
+          c, index_map_gpu.Dim(), block_dim, lambda_set_data_blocks,
+          (int32_t i, int32_t j) {
+            uint64_t index = index_map_data[i];
+            uint32_t orig_i = static_cast<uint32_t>(index),
+                     block_index = static_cast<uint32_t>(index >> 32);
+            int32_t row_start = row_splits_data[orig_i],
+                    row_end = row_splits_data[orig_i + 1],
+                    orig_j = (block_index * block_dim) + j;
+            const T *src_ptr = src_ptrs_data[orig_i];
+            if (orig_j < row_end - row_start) {
+              ans_data[row_start + orig_j] = src_ptr[orig_j];
+            }
+          });
     }
   }
   return ans;
@@ -389,7 +395,7 @@ Array1<T> Append(int32_t num_arrays, const Array1<T> **src) {
 
 template <typename T>
 Array1<T> Append(int32_t src_size, const Array1<T> *src) {
-  NVTX_RANGE("Append2");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK_GT(src_size, 0);
   std::vector<const Array1<T> *> srcs(src_size);
   for (int32_t i = 0; i != src_size; ++i) srcs[i] = src + i;
@@ -399,7 +405,7 @@ Array1<T> Append(int32_t src_size, const Array1<T> *src) {
 
 template <typename T, typename Op>
 void ApplyOpOnArray1(Array1<T> &src, T default_value, Array1<T> *dest) {
-  NVTX_RANGE("ApplyOpOnArray1");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK(IsCompatible(src, *dest));
   K2_CHECK_EQ(dest->Dim(), 1);
 
@@ -418,24 +424,43 @@ void ApplyOpOnArray1(Array1<T> &src, T default_value, Array1<T> *dest) {
   } else {
     K2_CHECK(c->GetDeviceType() == kCuda);
 
-    void *d_temp_storage = nullptr;
     size_t temp_storage_bytes = 0;
     // the first time is to determine temporary device storage requirements
     K2_CUDA_SAFE_CALL(cub::DeviceReduce::Reduce(
-        d_temp_storage, temp_storage_bytes, src_data, dest_data, size, op,
+        nullptr, temp_storage_bytes, src_data, dest_data, size, op,
         default_value, c->GetCudaStream()));
-    void *deleter_context;
-    d_temp_storage = c->Allocate(temp_storage_bytes, &deleter_context);
+    Array1<int8_t> d_temp_storage(c, temp_storage_bytes);
     K2_CUDA_SAFE_CALL(cub::DeviceReduce::Reduce(
-        d_temp_storage, temp_storage_bytes, src_data, dest_data, size, op,
-        default_value, c->GetCudaStream()));
+        d_temp_storage.Data(), temp_storage_bytes, src_data, dest_data, size,
+        op, default_value, c->GetCudaStream()));
   }
 }
 
+template <typename T, typename BinaryOp>
+void ApplyBinaryOpOnArray1(Array1<T> &src1, Array1<T> &src2, Array1<T> *dest) {
+  NVTX_RANGE(K2_FUNC);
+  K2_CHECK_NE(dest, nullptr);
+
+  int32_t dim = src1.Dim();
+  K2_CHECK_EQ(dim, src2.Dim());
+  K2_CHECK_EQ(dim, dest->Dim());
+  ContextPtr c = GetContext(src1, src2, *dest);
+
+  const T *src1_data = src1.Data();
+  const T *src2_data = src2.Data();
+  T *dest_data = dest->Data();
+
+  BinaryOp op;
+
+  K2_EVAL(
+      c, dim, lambda_set_values,
+      (int32_t i)->void { dest_data[i] = op(src1_data[i], src2_data[i]); });
+}
+
 template <typename T>
-Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value,
-                            T max_value) {
-  NVTX_RANGE("RandUniformArray1");
+Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value, T max_value,
+                            int32_t seed /*= 0*/) {
+  NVTX_RANGE(K2_FUNC);
   static_assert(std::is_floating_point<T>::value || std::is_integral<T>::value,
                 "Only support floating-point and integral type");
   Array1<T> temp(GetCpuContext(), dim);
@@ -447,7 +472,7 @@ Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value,
   if (max_value == min_value) {
     for (int32_t i = 0; i < dim; ++i) data[i] = min_value;
   } else {
-    internal::RandArray1Internal<T>(c, dim, min_value, max_value, data);
+    internal::RandArray1Internal<T>(c, dim, min_value, max_value, data, seed);
   }
   return temp.To(c);
 }
@@ -455,7 +480,7 @@ Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value,
 template <typename T>
 Array2<T> RandUniformArray2(ContextPtr c, int32_t dim0, int32_t dim1,
                             T min_value, T max_value) {
-  NVTX_RANGE("RandUniformArray2");
+  NVTX_RANGE(K2_FUNC);
   int32_t dim1_extra = RandInt(0, 2),  // make it randomly not contiguous.
       new_dim1 = dim1 + dim1_extra;
   Array1<T> array1temp =
@@ -467,25 +492,26 @@ Array2<T> RandUniformArray2(ContextPtr c, int32_t dim0, int32_t dim1,
 }
 
 template <typename T>
-Array1<T> Range(ContextPtr &c, int32_t dim, T first_value, T inc /*=1*/) {
-  NVTX_RANGE("Range");
+Array1<T> Range(ContextPtr c, int32_t dim, T first_value, T inc /*=1*/) {
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK_GE(dim, 0);
   Array1<T> ans = Array1<T>(c, dim);
   T *ans_data = ans.Data();
-  if (c->GetDeviceType() == kCpu) {
-    for (int32_t i = 0; i < dim; i++) ans_data[i] = first_value + i * inc;
-  } else {
-    auto lambda_set_values = [=] __device__(int32_t i) -> void {
-      ans_data[i] = first_value + i * inc;
-    };
-    EvalDevice(c, dim, lambda_set_values);
-  }
+
+  K2_EVAL(
+      c, dim, lambda_set_values,
+      (int32_t i)->void { ans_data[i] = first_value + i * inc; });
   return ans;
 }
 
 template <typename T>
+Array1<T> Arange(ContextPtr c, T begin, T end, T inc) {
+  return Range<T>(c, (end + inc - 1 - begin) / inc, begin, inc);
+}
+
+template <typename T>
 Array2<T> ToContiguous(const Array2<T> &src) {
-  NVTX_RANGE("ToContiguous");
+  NVTX_RANGE(K2_FUNC);
   int32_t dim0 = src.Dim0();
   int32_t dim1 = src.Dim1();
   int32_t elem_stride0 = src.ElemStride0();
@@ -493,17 +519,17 @@ Array2<T> ToContiguous(const Array2<T> &src) {
   Array2<T> ans(src.Context(), src.Dim0(), src.Dim1());
   T *out = ans.Data();
   const T *in = src.Data();
-  auto lambda_copy_elems = [=] __host__ __device__(int32_t i,
-                                                   int32_t j) -> void {
-    out[i * dim1 + j] = in[i * elem_stride0 + j];
-  };
-  Eval2(src.Context(), dim0, dim1, lambda_copy_elems);
+  K2_EVAL2(
+      src.Context(), dim0, dim1, lambda_copy_elems,
+      (int32_t i, int32_t j)->void {
+        out[i * dim1 + j] = in[i * elem_stride0 + j];
+      });
   return ans;
 }
 
 template <typename T>
 bool Equal(const Array1<T> &a, const Array1<T> &b) {
-  NVTX_RANGE("Equal(Array1)");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK_EQ(a.Dim(), b.Dim());
   ContextPtr c = GetContext(a, b);
   const T *a_data = a.Data(), *b_data = b.Data();
@@ -514,17 +540,17 @@ bool Equal(const Array1<T> &a, const Array1<T> &b) {
   } else {
     Array1<int32_t> is_same(c, 1, 1);
     int32_t *is_same_data = is_same.Data();
-    auto lambda_test = [=] __host__ __device__(int32_t i) -> void {
+    auto lambda_test = [=] __device__(int32_t i) -> void {
       if (a_data[i] != b_data[i]) *is_same_data = 0;
     };
-    Eval(c, a.Dim(), lambda_test);
+    EvalDevice(c, a.Dim(), lambda_test);
     return is_same[0];
   }
 }
 
 template <typename T>
 bool Equal(const Array2<T> &a, const Array2<T> &b) {
-  NVTX_RANGE("Equal(Array2)");
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK_EQ(a.Dim0(), b.Dim0());
   K2_CHECK_EQ(a.Dim1(), b.Dim1());
   ContextPtr c = GetContext(a, b);
@@ -550,7 +576,7 @@ bool Equal(const Array2<T> &a, const Array2<T> &b) {
   } else {
     Array1<int32_t> is_same(c, 1, 1);
     int32_t *is_same_data = is_same.Data();
-    auto lambda_test = [=] __host__ __device__(int32_t i, int32_t j) -> void {
+    auto lambda_test = [=] __device__(int32_t i, int32_t j) -> void {
       if (a_acc(i, j) != b_acc(i, j)) *is_same_data = 0;
     };
     Eval2Device(c, a.Dim0(), a.Dim1(), lambda_test);
@@ -560,7 +586,7 @@ bool Equal(const Array2<T> &a, const Array2<T> &b) {
 
 template <typename T>
 bool IsMonotonic(const Array1<T> &a) {
-  NVTX_RANGE("IsMonotonic");
+  NVTX_RANGE(K2_FUNC);
   ContextPtr &c = a.Context();
   int32_t dim = a.Dim();
   const T *data = a.Data();
@@ -571,17 +597,38 @@ bool IsMonotonic(const Array1<T> &a) {
   } else {
     Array1<int32_t> is_monotonic(c, 1, 1);
     int32_t *is_monotonic_data = is_monotonic.Data();
-    auto lambda_test = [=] __host__ __device__(int32_t i) -> void {
+    auto lambda_test = [=] __device__(int32_t i) -> void {
       if (data[i + 1] < data[i]) *is_monotonic_data = 0;
     };
-    Eval(c, dim - 1, lambda_test);
+    EvalDevice(c, dim - 1, lambda_test);
+    return is_monotonic[0];
+  }
+}
+
+template <typename T>
+bool IsMonotonicDecreasing(const Array1<T> &a) {
+  NVTX_RANGE(K2_FUNC);
+  ContextPtr &c = a.Context();
+  int32_t dim = a.Dim();
+  const T *data = a.Data();
+  if (c->GetDeviceType() == kCpu) {
+    for (int i = 0; i + 1 < dim; i++)
+      if (data[i + 1] > data[i]) return false;
+    return true;
+  } else {
+    Array1<int32_t> is_monotonic(c, 1, 1);
+    int32_t *is_monotonic_data = is_monotonic.Data();
+    auto lambda_test = [=] __device__(int32_t i) -> void {
+      if (data[i + 1] > data[i]) *is_monotonic_data = 0;
+    };
+    EvalDevice(c, dim - 1, lambda_test);
     return is_monotonic[0];
   }
 }
 
 template <typename S, typename T>
 void MonotonicLowerBound(const Array1<S> &src, Array1<T> *dest) {
-  NVTX_RANGE("MonotonicLowerBound");
+  NVTX_RANGE(K2_FUNC);
   K2_STATIC_ASSERT((std::is_convertible<S, T>::value));
   K2_CHECK(IsCompatible(src, *dest));
   int32_t dim = src.Dim();
@@ -618,29 +665,62 @@ void MonotonicLowerBound(const Array1<S> &src, Array1<T> *dest) {
   }
 }
 
+template <typename S, typename T>
+void MonotonicDecreasingUpperBound(const Array1<S> &src, Array1<T> *dest) {
+  NVTX_RANGE(K2_FUNC);
+  K2_STATIC_ASSERT((std::is_convertible<S, T>::value));
+  K2_CHECK(IsCompatible(src, *dest));
+  int32_t dim = src.Dim();
+  K2_CHECK_EQ(dest->Dim(), dim);
+
+  ContextPtr &c = src.Context();
+  const S *src_data = src.Data();
+  T *dest_data = dest->Data();
+
+  if (c->GetDeviceType() == kCpu) {
+    S max_value = std::numeric_limits<S>::min();
+    for (int32_t i = dim - 1; i >= 0; --i) {
+      max_value = std::max(src_data[i], max_value);
+      // we suppose it's safe to assign a value with type `S`
+      // to a value with type `T`
+      dest_data[i] = max_value;
+    }
+  } else {
+    K2_CHECK_EQ(c->GetDeviceType(), kCuda);
+    MaxOp<S> max_op;
+    internal::ConstReversedPtr<S> src_ptr =
+        internal::ConstReversedPtr<S>(src_data, dim);
+    internal::ReversedPtr<T> dest_ptr =
+        internal::ReversedPtr<T>(dest_data, dim);
+    // The first time is to determine temporary device storage requirements.
+    std::size_t temp_storage_bytes = 0;
+    K2_CHECK_CUDA_ERROR(cub::DeviceScan::InclusiveScan(
+        nullptr, temp_storage_bytes, src_ptr, dest_ptr, max_op, dim,
+        c->GetCudaStream()));
+    Array1<int8_t> d_temp_storage(c, temp_storage_bytes);
+    K2_CHECK_CUDA_ERROR(cub::DeviceScan::InclusiveScan(
+        d_temp_storage.Data(), temp_storage_bytes, src_ptr, dest_ptr, max_op,
+        dim, c->GetCudaStream()));
+  }
+}
+
 template <typename T>
 Array1<T> Plus(const Array1<T> &src, T t) {
-  NVTX_RANGE("Plus");
+  NVTX_RANGE(K2_FUNC);
   ContextPtr &c = src.Context();
   int32_t dim = src.Dim();
   Array1<T> ans(c, dim);
   const T *data = src.Data();
   T *ans_data = ans.Data();
-  if (c->GetDeviceType() == kCpu) {
-    for (int32_t i = 0; i < dim; ++i) ans_data[i] = data[i] + t;
-  } else {
-    auto lambda_add = [=] __host__ __device__(int32_t i) -> void {
-      ans_data[i] = data[i] + t;
-    };
-    Eval(c, dim, lambda_add);
-  }
+  K2_EVAL(
+      c, dim, lambda_add, (int32_t i)->void { ans_data[i] = data[i] + t; });
   return ans;
 }
 
 template <typename T>
 Array1<T> Index(const Array1<T> &src, const Array1<int32_t> &indexes,
                 bool allow_minus_one) {
-  NVTX_RANGE("Index(Array1)");
+  NVTX_RANGE(K2_FUNC);
   ContextPtr &c = src.Context();
   K2_CHECK(c->IsCompatible(*indexes.Context()));
   int32_t ans_dim = indexes.Dim();
@@ -683,7 +763,7 @@ Array1<T> Index(const Array1<T> &src, const Array1<int32_t> &indexes,
 template <typename T>
 Array2<T> IndexRows(const Array2<T> &src, const Array1<int32_t> &indexes,
                     bool allow_minus_one) {
-  NVTX_RANGE("Index(Array2)");
+  NVTX_RANGE(K2_FUNC);
   ContextPtr &c = src.Context();
   K2_CHECK(c->IsCompatible(*indexes.Context()));
   int32_t ans_dim0 = indexes.Dim(), dim1 = src.Dim1();
@@ -726,6 +806,126 @@ Array2<T> IndexRows(const Array2<T> &src, const Array1<int32_t> &indexes,
       Eval2Device(c, ans_dim0, dim1, lambda_set_values);
     }
   }
+  return ans;
+}
+
+template <typename T, typename Compare>
+static void SortCpu(Array1<T> *array, Array1<int32_t> *index_map) {
+  Compare comp;
+  if (index_map != nullptr) {
+    Array1<int32_t> tmp_index_map = Range(array->Context(), array->Dim(), 0);
+    const T *array_data = array->Data();
+    std::sort(tmp_index_map.Data(), tmp_index_map.Data() + tmp_index_map.Dim(),
+              [array_data, comp](int32_t i, int32_t j) {
+                return comp(array_data[i], array_data[j]);
+              });
+    *index_map = std::move(tmp_index_map);
+  }
+
+  std::sort(array->Data(), array->Data() + array->Dim(), comp);
+}
+
+template <typename T, typename Compare /*= LessThan<T>*/>
+void Sort(Array1<T> *array, Array1<int32_t> *index_map /*= nullptr*/) {
+  if (!array->IsValid()) return;
+
+  ContextPtr &context = array->Context();
+  if (context->GetDeviceType() == kCpu)
+    return SortCpu<T, Compare>(array, index_map);
+
+  K2_DCHECK_EQ(context->GetDeviceType(), kCuda);
+
+  mgpu::context_t *mgpu_context = GetModernGpuAllocator(context);
+
+  if (index_map != nullptr) {
+    *index_map = Range(context, array->Dim(), 0);
+    mgpu::mergesort(array->Data(), index_map->Data(), array->Dim(), Compare(),
+                    *mgpu_context);
+  } else {
+    mgpu::mergesort(array->Data(), array->Dim(), Compare(), *mgpu_context);
+  }
+}
+
+template <typename T>
+void Assign(Array2<T> &src, Array2<T> *dest) {
+  K2_CHECK_EQ(src.Dim0(), dest->Dim0());
+  K2_CHECK_EQ(src.Dim1(), dest->Dim1());
+  int32_t dim0 = src.Dim0(), dim1 = src.Dim1(), src_stride = src.ElemStride0(),
+          dest_stride = dest->ElemStride0();
+
+  if (src_stride == dim1 && dest_stride == dim1) {
+    size_t num_bytes = dim0 * src.ElementSize() * dim1;
+    src.Context()->CopyDataTo(num_bytes, src.Data(), dest->Context(),
+                              dest->Data());
+  } else {
+    // this branch does not support cross-device copy.
+    ContextPtr c = GetContext(src, *dest);
+    T *dest_data = dest->Data();
+    const T *src_data = src.Data();
+    if (c->GetDeviceType() == kCpu) {
+      size_t row_length_bytes = src.ElementSize() * dim1;
+      for (int32_t r = 0; r < dim0;
+           r++, dest_data += dest_stride, src_data += src_stride) {
+        memcpy(static_cast<void *>(dest_data),
+               static_cast<const void *>(src_data), row_length_bytes);
+      }
+    } else {
+      auto lambda_copy_data = [=] __device__(int32_t i, int32_t j) {
+        dest_data[i * dest_stride + j] = src_data[i * src_stride + j];
+      };
+      Eval2Device(c, dim0, dim1, lambda_copy_data);
+    }
+  }
+}
+
+
+template <typename S, typename T>
+void Assign(Array1<S> &src, Array1<T> *dest) {
+  K2_CHECK_EQ(src.Dim(), dest->Dim());
+  int32_t dim = src.Dim();
+  if (std::is_same<S,T>::value) {
+    size_t num_bytes = dim * sizeof(S);
+    src.Context()->CopyDataTo(num_bytes, src.Data(), dest->Context(),
+                              dest->Data());
+  } else {
+    if (!src.Context()->IsCompatible(*dest->Context())) {
+      Array1<S> src_new = src.To(dest->Context());
+      Assign(src_new, dest);
+    }
+    const S *src_data = src.Data();
+    T *dest_data = dest->Data();
+    K2_EVAL(src.Context(), dim, lambda_copy_data, (int32_t i) -> void {
+        dest_data[i] = src_data[i];
+      });
+  }
+}
+
+
+template <typename T>
+Array1<T> MergeWithMap(const Array1<uint32_t> &merge_map, int32_t num_srcs,
+                       const Array1<T> **src) {
+  NVTX_RANGE(K2_FUNC);
+  int32_t dim = merge_map.Dim();
+  ContextPtr &c = merge_map.Context();
+  std::vector<const T *> src_ptrs_vec(num_srcs);
+  int32_t src_tot_dim = 0;
+  for (int32_t i = 0; i < num_srcs; ++i) {
+    K2_CHECK(c->IsCompatible(*src[i]->Context()));
+    src_tot_dim += src[i]->Dim();
+    src_ptrs_vec[i] = src[i]->Data();
+  }
+  K2_CHECK_EQ(src_tot_dim, dim);
+  Array1<const T *> src_ptrs(c, src_ptrs_vec);
+  Array1<T> ans(c, dim);
+  const uint32_t *merge_map_data = merge_map.Data();
+  T *ans_data = ans.Data();
+  const T **src_ptrs_data = src_ptrs.Data();
+  K2_EVAL(
+      c, dim, lambda_merge_data, (int32_t i)->void {
+        uint32_t m = merge_map_data[i], src_idx = m % (uint32_t)num_srcs,
+                 src_pos = m / (uint32_t)num_srcs;
+        ans_data[i] = src_ptrs_data[src_idx][src_pos];
+      });
   return ans;
 }
 

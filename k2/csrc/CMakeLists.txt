@@ -28,21 +28,27 @@ endif()
 set(context_srcs
   algorithms.cu
   array_ops.cu
-  intersect.cu
-  top_sort.cu
   context.cu
   dtype.cu
   fsa.cu
   fsa_algo.cu
   fsa_utils.cu
   host_shim.cu
+  intersect.cu
+  intersect_dense.cu
+  intersect_dense_pruned.cu
   math.cu
   moderngpu_allocator.cu
+  pinned_context.cu
   ragged.cu
   ragged_ops.cu
+  ragged_utils.cu
+  rm_epsilon.cu
   tensor.cu
   tensor_ops.cu
+  thread_pool.cu
   timer.cu
+  top_sort.cu
   utils.cu
 )
 
@@ -80,13 +86,20 @@ set(cuda_tests
   fsa_algo_test
   fsa_test
   fsa_utils_test
+  hash_test
   host_shim_test
   intersect_test
   log_test
+  macros_test
   nvtx_test
+  pinned_context_test
   ragged_shape_test
   ragged_test
+  ragged_utils_test
+  rm_epsilon_test
+  tensor_ops_test
   tensor_test
+  thread_pool_test
   top_sort_test
   utils_test
 )
@@ -115,3 +128,7 @@ endfunction()
 foreach(name IN LISTS cuda_tests)
   k2_add_cuda_test(${name})
 endforeach()
+
+if(K2_ENABLE_BENCHMARK)
+  add_subdirectory(benchmark)
+endif()

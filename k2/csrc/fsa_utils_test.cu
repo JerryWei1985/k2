@@ -213,19 +213,11 @@ TEST(FsaToString, Transducer) {
   K2_LOG(INFO) << "\n---negating---\n" << str;
 }
 
-template <DeviceType d>
-void TestGetDestStates() {
-  ContextPtr cpu = GetCpuContext();  // will use to copy data
-  ContextPtr context = nullptr;
-  if (d == kCpu) {
-    context = GetCpuContext();
-  } else {
-    K2_CHECK_EQ(d, kCuda);
-    context = GetCudaContext();
-  }
-
-  // test with simple case should be good enough
-  std::string s1 = R"(0 1 1 0
+TEST(FsaUtilsTest, TestGetDestStates) {
+  ContextPtr cpu = GetCpuContext();  // will be used to copy data
+  for (auto &context : {GetCpuContext(), GetCudaContext()}) {
+    // test with simple case should be good enough
+    std::string s1 = R"(0 1 1 0
 0 2  1 0
 0 3  1 0
 0 3  2 0
@@ -237,7 +229,7 @@ void TestGetDestStates() {
 5
 )";
 
-  std::string s2 = R"(0 1 1 0
+    std::string s2 = R"(0 1 1 0
 0 2  1 0
 1 2  1 0
 1 3  1 0
@@ -246,36 +238,34 @@ void TestGetDestStates() {
 4
 )";
 
-  Fsa fsa1 = FsaFromString(s1);
-  Fsa fsa2 = FsaFromString(s2);
-  Fsa *fsa_array[] = {&fsa1, &fsa2};
-  FsaVec fsa_vec = CreateFsaVec(2, &fsa_array[0]);
-  fsa_vec = fsa_vec.To(context);
+    Fsa fsa1 = FsaFromString(s1);
+    Fsa fsa2 = FsaFromString(s2);
+    Fsa *fsa_array[] = {&fsa1, &fsa2};
+    FsaVec fsa_vec = CreateFsaVec(2, &fsa_array[0]);
+    fsa_vec = fsa_vec.To(context);
 
-  {
-    // as_idx01 = false
-    Array1<int32_t> result = GetDestStates(fsa_vec, false);
-    ASSERT_EQ(result.Dim(), fsa_vec.NumElements());
-    result = result.To(cpu);
-    std::vector<int32_t> cpu_data(result.Data(), result.Data() + result.Dim());
-    EXPECT_THAT(cpu_data, ::testing::ElementsAre(1, 2, 3, 3, 2, 3, 4, 5, 5, 1,
-                                                 2, 2, 3, 3, 4));
+    {
+      // as_idx01 = false
+      Array1<int32_t> result = GetDestStates(fsa_vec, false);
+      ASSERT_EQ(result.Dim(), fsa_vec.NumElements());
+      result = result.To(cpu);
+      std::vector<int32_t> cpu_data(result.Data(),
+                                    result.Data() + result.Dim());
+      EXPECT_THAT(cpu_data, ::testing::ElementsAre(1, 2, 3, 3, 2, 3, 4, 5, 5, 1,
+                                                   2, 2, 3, 3, 4));
+    }
+
+    {
+      // as_idx01 = true
+      Array1<int32_t> result = GetDestStates(fsa_vec, true);
+      ASSERT_EQ(result.Dim(), fsa_vec.NumElements());
+      result = result.To(cpu);
+      std::vector<int32_t> cpu_data(result.Data(),
+                                    result.Data() + result.Dim());
+      EXPECT_THAT(cpu_data, ::testing::ElementsAre(1, 2, 3, 3, 2, 3, 4, 5, 5, 7,
+                                                   8, 8, 9, 9, 10));
+    }
   }
-
-  {
-    // as_idx01 = true
-    Array1<int32_t> result = GetDestStates(fsa_vec, true);
-    ASSERT_EQ(result.Dim(), fsa_vec.NumElements());
-    result = result.To(cpu);
-    std::vector<int32_t> cpu_data(result.Data(), result.Data() + result.Dim());
-    EXPECT_THAT(cpu_data, ::testing::ElementsAre(1, 2, 3, 3, 2, 3, 4, 5, 5, 7,
-                                                 8, 8, 9, 9, 10));
-  }
-}
-
-TEST(FsaUtilsTest, TestGetDestStates) {
-  TestGetDestStates<kCpu>();
-  TestGetDestStates<kCuda>();
 }
 
 class StatesBatchSuiteTest : public ::testing::Test {
@@ -932,6 +922,109 @@ TEST(FsaUtils, ConvertDenseToFsaVec) {
     EXPECT_EQ((fsa_vec[{2, 2, 1}]), (Arc{2, 3, 1, 11}));
     EXPECT_EQ((fsa_vec[{2, 3, 0}]), (Arc{3, 4, -1, 0}));
   }
+}
+
+TEST(FsaUtils, ComposeArcMapsTest) {
+  for (auto &context : {GetCpuContext(), GetCudaContext()}) {
+    {
+      // simple case
+      const std::vector<int32_t> arc_map1_row_splits = {0, 2, 2, 3, 6};
+      Array1<int32_t> arc_map1_row_splits_array(context, arc_map1_row_splits);
+      RaggedShape arc_map1_shape =
+          RaggedShape2(&arc_map1_row_splits_array, nullptr, -1);
+      const std::vector<int32_t> arc_map1_values = {1, 5, 4, 8, -1, 0};
+      Array1<int32_t> arc_map1_values_array(context, arc_map1_values);
+      Ragged<int32_t> arc_map1(arc_map1_shape, arc_map1_values_array);
+
+      const std::vector<int32_t> arc_map2_row_splits = {0, 1, 3, 3, 8};
+      Array1<int32_t> arc_map2_row_splits_array(context, arc_map2_row_splits);
+      RaggedShape arc_map2_shape =
+          RaggedShape2(&arc_map2_row_splits_array, nullptr, -1);
+      const std::vector<int32_t> arc_map2_values = {2, 0, 1, 2, 3, 0, 1, 3};
+      Array1<int32_t> arc_map2_values_array(context, arc_map2_values);
+      Ragged<int32_t> arc_map2(arc_map2_shape, arc_map2_values_array);
+
+      Ragged<int> ans = ComposeArcMaps(arc_map1, arc_map2);
+      EXPECT_EQ(ans.NumAxes(), 2);
+      EXPECT_EQ(ans.Dim0(), arc_map2.Dim0());
+      const std::vector<int32_t> expected_row_splits = {0, 1, 3, 3, 12};
+      const std::vector<int32_t> expected_values = {4, 1, 5, 4, 8,  -1,
+                                                    0, 1, 5, 8, -1, 0};
+      CheckArrayData(ans.RowSplits(1), expected_row_splits);
+      CheckArrayData(ans.values, expected_values);
+    }
+
+    {
+      // test with random size
+      ContextPtr cpu = GetCpuContext();
+      for (auto &context : {GetCpuContext(), GetCudaContext()}) {
+        for (int32_t i = 0; i < 2; ++i) {
+          Ragged<int32_t> arc_map1 =
+              RandomRagged<int32_t>(-1, 100, 2, 2, 0, 1000).To(context);
+          RaggedShape arc_map2_shape =
+              RandomRaggedShape(false, 2, 2, 0, 1000).To(context);
+          int32_t arc_map1_dim0 = arc_map1.Dim0(),
+                  arc_map2_value_dim = arc_map2_shape.NumElements();
+          if (arc_map1_dim0 == 0) continue;
+          Array1<int32_t> arc_map2_values = RandUniformArray1(
+              context, arc_map2_value_dim, 0, arc_map1_dim0 - 1);
+          Ragged<int32_t> arc_map2(arc_map2_shape, arc_map2_values);
+
+          Ragged<int32_t> ans = ComposeArcMaps(arc_map1, arc_map2);
+          EXPECT_EQ(ans.NumAxes(), 2);
+          EXPECT_EQ(ans.Dim0(), arc_map2.Dim0());
+          ans = ans.To(cpu);
+          arc_map1 = arc_map1.To(cpu);
+          arc_map2 = arc_map2.To(cpu);
+          const int32_t *arc_map1_row_splits = arc_map1.RowSplits(1).Data(),
+                        *arc_map2_row_splits = arc_map2.RowSplits(1).Data(),
+                        *ans_row_splits = ans.RowSplits(1).Data();
+          const int32_t *arc_map1_value = arc_map1.values.Data(),
+                        *arc_map2_value = arc_map2.values.Data(),
+                        *ans_value = ans.values.Data();
+          int32_t ans_tot_size = 0;
+          int32_t ans_idx01 = 0;
+          for (int32_t i = 0; i != arc_map2.Dim0(); ++i) {
+            int32_t arc_map2_row_begin = arc_map2_row_splits[i],
+                    arc_map2_row_end = arc_map2_row_splits[i + 1];
+            for (int32_t j = arc_map2_row_begin; j != arc_map2_row_end; ++j) {
+              int32_t arc_map1_index = arc_map2_value[j];
+              ASSERT_GE(arc_map1_index, 0);
+              ASSERT_LT(arc_map1_index, arc_map1_dim0);
+              int32_t arc_map1_row_begin = arc_map1_row_splits[arc_map1_index],
+                      arc_map1_row_end =
+                          arc_map1_row_splits[arc_map1_index + 1];
+              ans_tot_size += arc_map1_row_end - arc_map1_row_begin;
+              for (int32_t n = arc_map1_row_begin; n != arc_map1_row_end; ++n) {
+                int32_t cur_value = arc_map1_value[n];
+                int32_t cur_ans_value = ans_value[ans_idx01++];
+                EXPECT_EQ(cur_value, cur_ans_value);
+              }
+            }
+            // check row_splits of ans
+            EXPECT_EQ(ans_tot_size, ans_row_splits[i + 1]);
+          }
+        }
+      }
+    }
+  }
+}
+
+
+TEST(FixNumStates, FixNumStates) {
+  FsaVec f("[ [ [] []  ] [ [] [] ] ]"),
+      g("[ [ []  ] [ [] [] ] ]"),
+      h("[ [ ] [ [] [] ] ]");
+
+  FsaVec f2(f), g2(g), h2(h);
+
+  FixNumStates(&f2);
+  FixNumStates(&g2);
+  FixNumStates(&h2);
+
+  EXPECT_EQ(Equal(f, f2), true);
+  EXPECT_EQ(Equal(h, g2), true);
+  EXPECT_EQ(Equal(h, h2), true);
 }
 
 }  // namespace k2

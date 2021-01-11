@@ -15,10 +15,12 @@
 
 #include <cassert>
 #include <type_traits>
+#include <vector>
 
 #include "k2/csrc/array.h"
 #include "k2/csrc/context.h"
 #include "k2/csrc/log.h"
+#include "k2/csrc/macros.h"
 #include "k2/csrc/ragged.h"
 #include "k2/csrc/utils.h"
 
@@ -61,6 +63,7 @@ void Transpose(ContextPtr &c, const Array2<T> &src, Array2<T> *dest);
  */
 template <typename S, typename T>
 void ExclusiveSum(const Array1<S> &src, Array1<T> *dest) {
+  NVTX_RANGE(K2_FUNC);
   K2_CHECK(IsCompatible(src, *dest));
   int32_t src_dim = src.Dim();
   int32_t dest_dim = dest->Dim();
@@ -79,6 +82,7 @@ void ExclusiveSum(const Array1<S> &src, Array1<T> *dest) {
  */
 template <typename T>
 Array1<T> ExclusiveSum(const Array1<T> &src) {
+  NVTX_RANGE(K2_FUNC);
   Array1<T> ans(src.Context(), src.Dim());
   ExclusiveSum(src, &ans);
   return ans;
@@ -151,6 +155,7 @@ Array1<T> Append(int32_t src_size, const Array1<T> *src);
 
    It appends the arrays with an offset.  Define:
         offset[i] = (sum of last element of src[j] for j < i).
+        offset[i] = 0 for i = 0.
    This function appends the arrays, while leaving out the last element
    of all but the last of the arrays in `src`, and also adding the
    offsets mentioned above for each array.
@@ -194,7 +199,7 @@ void Max(Array1<T> &src, T default_value, Array1<T> *dest) {
 }
 
 template <typename T>
-T MaxValue(Array1<T> &src) {
+T MaxValue(const Array1<T> &src) {
   return MaxValue(src.Context(), src.Dim(), src.Data());
 }
 
@@ -223,6 +228,63 @@ void Or(Array1<T> &src, T default_value, Array1<T> *dest) {
 }
 
 /*
+  Call BinaryOp on each element in `src1` and `src2`, then write the result
+  to the corresponding element in `dest`, i.e.
+  for 0 <= i < dest_dim = src1_dim == src2_dim.
+    dest[i] = BinaryOp(src1[i], src2[i])
+  Noted `src1`, `src2` and `dest` must have the same Dim() and on the same
+  device. It is allowable for &src1 == &src2 == dest.
+*/
+template <typename T, typename BinaryOp>
+void ApplyBinaryOpOnArray1(Array1<T> &src1, Array1<T> &src2, Array1<T> *dest);
+
+// Call PlusOp on `src1` and `src2` and save the result to `dest`,
+// i.e. dest[i] = src1[i] + src2[i]
+template <typename T>
+void Plus(Array1<T> &src1, Array1<T> &src2, Array1<T> *dest) {
+  ApplyBinaryOpOnArray1<T, PlusOp<T>>(src1, src2, dest);
+}
+
+// A wrapper function for Plus above, ans[i] = src1[i] + src2[i].
+template <typename T>
+Array1<T> Plus(Array1<T> &src1, Array1<T> &src2) {
+  K2_CHECK_EQ(src1.Dim(), src2.Dim());
+  Array1<T> ans(GetContext(src1, src2), src1.Dim());
+  Plus(src1, src2, &ans);
+  return ans;
+}
+
+// Same with `Plus`, but with `MinusOp`, i.e. dest[i] = src1[i] - src2[i].
+template <typename T>
+void Minus(Array1<T> &src1, Array1<T> &src2, Array1<T> *dest) {
+  ApplyBinaryOpOnArray1<T, MinusOp<T>>(src1, src2, dest);
+}
+
+// A wrapper function for Minus above, ans[i] = src1[i] - src2[i].
+template <typename T>
+Array1<T> Minus(Array1<T> &src1, Array1<T> &src2) {
+  K2_CHECK_EQ(src1.Dim(), src2.Dim());
+  Array1<T> ans(GetContext(src1, src2), src1.Dim());
+  Minus(src1, src2, &ans);
+  return ans;
+}
+
+// Same with `Plus`, but with `TimesOp`, i.e. dest[i] = src1[i] * src2[i].
+template <typename T>
+void Times(Array1<T> &src1, Array1<T> &src2, Array1<T> *dest) {
+  ApplyBinaryOpOnArray1<T, TimesOp<T>>(src1, src2, dest);
+}
+
+// A wrapper function for Times above, ans[i] = src1[i] * src2[i].
+template <typename T>
+Array1<T> Times(Array1<T> &src1, Array1<T> &src2) {
+  K2_CHECK_EQ(src1.Dim(), src2.Dim());
+  Array1<T> ans(GetContext(src1, src2), src1.Dim());
+  Times(src1, src2, &ans);
+  return ans;
+}
+
+/*
   Returns a random Array1, uniformly distributed betwen `min_value` and
   `max_value`.  CAUTION: for now, this will be randomly generated on CPU and
   then transferred to other devices if c is not a CPU context, so it will be
@@ -232,14 +294,17 @@ void Or(Array1<T> &src, T default_value, Array1<T> *dest) {
     @param[in] c  Context for this array; note, this function will be slow
                   if this is not a CPU context
     @param [in] dim    Dimension, must be > 0
-    @param[in] min_value  Minimum value allowed in the array
-    @param[in] max_value  Maximum value allowed in the array;
+    @param [in] min_value  Minimum value allowed in the array
+    @param [in] max_value  Maximum value allowed in the array;
                            require max_value >= min_value.
+    @param [in] seed  The seed for the random generator. 0 to
+                      use the default seed. Set it to a non-zero
+                      value for reproducibility.
     @return    Returns the randomly generated array
  */
 template <typename T>
-Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value,
-                            T max_value);
+Array1<T> RandUniformArray1(ContextPtr c, int32_t dim, T min_value, T max_value,
+                            int32_t seed = 0);
 
 /*
   Returns a random Array2, uniformly distributed betwen `min_value` and
@@ -268,8 +333,11 @@ Array2<T> RandUniformArray2(ContextPtr c, int32_t dim0, int32_t dim1,
   Return a newly allocated Array1 whose values form a linear sequence,
    so ans[i] = first_value + i * inc.
 */
-template <typename T>
-Array1<T> Range(ContextPtr &c, int32_t dim, T first_value, T inc = 1);
+template <typename T = int32_t>
+Array1<T> Range(ContextPtr c, int32_t dim, T first_value, T inc = 1);
+
+template <typename T = int32_t>
+Array1<T> Arange(ContextPtr c, T begin, T end, T inc = 1);
 
 /*
   This is a convenience wrapper for the function of the same name in utils.h.
@@ -282,6 +350,17 @@ void RowSplitsToRowIds(const Array1<int32_t> &row_splits,
                        Array1<int32_t> *row_ids);
 
 /*
+  Given a vector of row_splits, return a vector of sizes.
+
+     @param [in] row_splits   Row-splits array, should be non-decreasing,
+                            and have Dim() >= 1
+     @return   Returns array of sizes, satisfying `ans.Dim() ==
+               row_splits.Dim() - 1` and
+              `ans[i] = row_splits[i+1] - row_splits[i]`.
+ */
+Array1<int32_t> RowSplitsToSizes(const Array1<int32_t> &row_splits);
+
+/*
   This is a convenience wrapper for the function of the same name in utils.h.
    @param [in] row_ids     Input row_ids vector, of dimension num_elems
    @param [out] row_splits  row_splits vector to whose data we will write,
@@ -292,6 +371,33 @@ void RowSplitsToRowIds(const Array1<int32_t> &row_splits,
  */
 void RowIdsToRowSplits(const Array1<int32_t> &row_ids,
                        Array1<int32_t> *row_splits);
+
+/*
+  Creates a merge-map from a vector of sizes.  A merge-map is something we
+  sometimes create when we want to combine elements from a fixed number of
+  sources.  If there are `num_srcs` sources, `merge_map[i] % num_srcs`
+  gives the index of the source that the i'th element came from,
+  and `merge_map[i] / num_srcs` is the index within the i'th source.
+
+  This function is for when the sources are to be appended together.
+
+     @param [in] c      Context which we want the result to use
+     @param [in] sizes  Sizes of source arrays, which are to be appended.
+                        Must have `sizes[i] > 0`.  `ans.Dim()` will equal
+                        the sum of `sizes`.
+     @return            Returns the merge map.
+
+
+   NOTE: this function makes the most sense to call when you won't be
+   needing the row-splits or row-ids that can be obtained from `sizes`.
+   If you need those, it would be easier to create the merge_map directly
+   from the row_ids and row_splits.
+
+   EXAMPLE.  Suppose sizes is [ 3, 5, 1 ].  Then merge_map will be:
+    [ 0, 3, 6, 1, 4, 7, 10, 13, 2 ].
+ */
+Array1<uint32_t> SizesToMergeMap(ContextPtr c,
+                                 const std::vector<int32_t> &sizes);
 
 /*
   Returns a new Array1<T> whose elements are this array's elements plus t.
@@ -317,6 +423,45 @@ bool Equal(const Array1<T> &a, const Array1<T> &b);
  */
 template <typename T>
 bool IsMonotonic(const Array1<T> &a);
+/*
+  Return true if array `a` is monotonically decreasing, i.e.
+  a[i+1] >= a[i].
+ */
+template <typename T>
+bool IsMonotonicDecreasing(const Array1<T> &a);
+
+/*
+  Generalized function inverse for an array viewed as a function which is
+  monotonically decreasing.
+
+     @param [in] src   Array which is monotonically decreasing (not necessarily
+                      strictly) and whose elements are all positive, e.g.
+                      [ 5 5 4 2 1 ]
+     @return          Returns an array such that ans.Dim() == src[0],
+                      such that ans[i] = min(j >= 0 : src[j] <= i).
+                      We pretend values past the end of `src` are zeros.
+                      In this case the result would be:
+                      [ 5 4 3 3 2].
+                      Notice ans[0] = 5 here, we get it because we pretend
+                      `src` is [5 5 4 2 1 0]
+
+    Note:             InvertMonotonicDecreasing(InvertMonotonicDecreasing(x))
+                      will always equal x if x satisfies the preconditions.
+
+   Implementation notes: allocate ans as zeros; run lambda {
+   if (i + 1 == src_dim || src[i+1] < src[i])
+       ans[src[i] - 1] = i + 1 } -> ans = [ 5 4 0 3 2]
+   in this example; call MonotonicDecreasingUpperBound(ans, &ans).
+ */
+Array1<int32_t> InvertMonotonicDecreasing(const Array1<int32_t> &src);
+
+/*
+  Assuming `src` is a permutation of Range(0, src.Dim()), returns the inverse of
+  that permutation, such that ans[src[i]] = i.  It is an error, and may cause a
+  segfault or undefined results, if `src` was not a permutation of Range(0,
+  src.Dim()).
+ */
+Array1<int32_t> InvertPermutation(const Array1<int32_t> &src);
 
 /*
    Validate a row_ids vector; this just makes sure its elements are nonnegative
@@ -375,10 +520,28 @@ bool ValidateRowSplitsAndIds(const Array1<int32_t> &row_splits,
   At exit, `d = *dest` will be the largest sequence that is monotonically
   increasing (i.e. `d[i] <= d[i+1]`) and for which `d[i] <= src[i]`.  We
   compute this using an inclusive scan using a min operator on the
-  reverse of the arrays `src` and `dest`.
+  reverse of the array `src` with output to the reverse of the
+  array `dest`.
  */
 template <typename S, typename T>
 void MonotonicLowerBound(const Array1<S> &src, Array1<T> *dest);
+
+/*
+  Compute a monotonically decreasing upper bound on the array `src`,
+  putting the result in `dest` (which may be the same array as `src`).
+
+      @param [in] src  Source array (may be empty)
+      @param [out] dest   Destination array (already allocated);
+                       must be on the same device as `src` and have the same
+                       dimension; may be the same as `src`.
+
+  At exit, `d = *dest` will be the smallest sequence that is monotonically
+  decreasing (i.e. `d[i] >= d[i+1]`) and for which `d[i] >= src[i]`.  We
+  compute this using an inclusive scan using a max operator on the reverse
+  of array `src` with output to the reverse of array `dest`.
+ */
+template <typename S, typename T>
+void MonotonicDecreasingUpperBound(const Array1<S> &src, Array1<T> *dest);
 
 /*
    Returns counts of numbers in the array
@@ -390,6 +553,18 @@ void MonotonicLowerBound(const Array1<S> &src, Array1<T> *dest);
    See also GetCountsPartitioned in ragged.h.
 */
 Array1<int32_t> GetCounts(const Array1<int32_t> &src, int32_t n);
+
+/* Returns counts of numbers in the array.
+
+    @param [in] c  Context of `src_data`.
+    @param [in] src_data  The source array.
+    @param [in] src_dim   The dimension of the src array.
+    @param [in] n         Number of counts; we require `0 <= src_data[i] < n`.
+
+    See also GetCounts above.
+ */
+Array1<int32_t> GetCounts(ContextPtr c, const int32_t *src_data,
+                          int32_t src_dim, int32_t n);
 
 template <typename T>
 Array2<T> ToContiguous(const Array2<T> &src);
@@ -432,6 +607,54 @@ Array1<T> Index(const Array1<T> &src, const Array1<int32_t> &indexes,
 template <typename T>
 Array2<T> IndexRows(const Array2<T> &src, const Array1<int32_t> &indexes,
                     bool allow_minus_one);
+
+/* Sort an array **in-place**.
+
+   @param [inout]   array        The array to be sorted.
+   @param [out]     index_map    If non-null, it will be set to
+                          a new array that maps the index of the returned array
+                          to the original unsorted array. That is, out[i] =
+                          unsorted[index_map[i]] for i in [0, array->Dim()) if
+                          `unsorted` was the value of `array` at input and `out`
+                          is the value after the function call.
+ */
+template <typename T, typename Compare = LessThan<T>>
+void Sort(Array1<T> *array, Array1<int32_t> *index_map = nullptr);
+
+/*
+  Assign elements from `src` to `dest`; they must have the same shape.  For now
+  this only supports cross-device copy if the data is contiguous.
+ */
+template <typename T>
+void Assign(Array2<T> &src, Array2<T> *dest);
+
+/*
+  Assign elements from `src` to `dest`; they must have the same Dim().
+ */
+template <typename S, typename T>
+void Assign(Array1<S> &src, Array1<T> *dest);
+
+
+/*
+  Merge an array of Array1<T> with a `merge_map` which indicates which items
+  to get from which positions (doesn't do any checking of the merge_map values!)
+
+    @param [in] merge_map   Array which is required to have the same dimension
+                            as the sum of src[i]->Dim().
+                            If merge_map[i] == m, it indicates that the i'th
+                            position in the answer should come from
+                            element `m / num_srcs` within `*src[m % num_srcs]`.
+    @param [in] num_srcs  Number of Array1's in the source array
+    @param [in] src       Array of sources; total Dim() must equal
+                          merge_map.Dim()
+    @return               Returns array with elements combined from those in
+                          `src`.
+
+   CAUTION: may segfault if merge_map contains invalid values.
+ */
+template <typename T>
+Array1<T> MergeWithMap(const Array1<uint32_t> &merge_map, int32_t num_srcs,
+                       const Array1<T> **src);
 
 }  // namespace k2
 

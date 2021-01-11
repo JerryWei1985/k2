@@ -13,7 +13,7 @@ cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
 
 project(k2 CUDA CXX)
 
-set(K2_VERSION "0.1.1")
+set(K2_VERSION "0.1.2")
 
 # ----------------- Supported build types for K2 project -----------------
 set(ALLOWABLE_BUILD_TYPES Debug Release RelWithDebInfo MinSizeRel)
@@ -33,6 +33,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(BUILD_SHARED_LIBS "Whether to build shared or static lib" ON)
 option(K2_USE_PYTORCH "Whether to build with PyTorch" ON)
 option(K2_ENABLE_NVTX "Whether to build with the NVTX library" ON)
+option(K2_ENABLE_BENCHMARK "Whether to enable benchmark" ON)
 
 if(NOT K2_USE_PYTORCH)
   message(FATAL_ERROR "\
@@ -54,6 +55,7 @@ execute_process(COMMAND
   OUTPUT_VARIABLE K2_OS
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+string(REGEX REPLACE "^\"+|\"+$" "" K2_OS "${K2_OS}")
 message(STATUS "K2_OS: ${K2_OS}")
 
 find_package(Git REQUIRED)
@@ -74,6 +76,15 @@ execute_process(COMMAND
 include(CheckIncludeFileCXX)
 check_include_file_cxx(cxxabi.h K2_HAVE_CXXABI_H)
 check_include_file_cxx(execinfo.h K2_HAVE_EXECINFO_H)
+
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-std=c++14" K2_COMPILER_SUPPORTS_CXX14)
+if(NOT K2_COMPILER_SUPPORTS_CXX14)
+  message(FATAL_ERROR "
+    k2 requires a compiler supporting at least C++14.
+    If you are using GCC, please upgrade it to at least version 5.0.
+    If you are using Clang, please upgrade it to at least version 3.4.")
+endif()
 
 # ========= Settings for CUB begin =========
 # the following settings are modified from cub/CMakeLists.txt
@@ -126,6 +137,6 @@ include(cub)
 include(moderngpu)
 include(googletest)
 
-set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CUDA_FLAGS}")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_CUDA_FLAGS} --compiler-options -Wall --compiler-options -Wno-unknown-pragmas")
 
 add_subdirectory(k2)

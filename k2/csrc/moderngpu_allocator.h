@@ -15,12 +15,23 @@
 
 #include <memory>
 
+#include "k2/csrc/context.h"
 #include "moderngpu/context.hxx"
 
 namespace k2 {
-// Return a context for moderngpu that has a better memory allocator
-// than mgpu::standard_context_t
-std::unique_ptr<mgpu::context_t> GetModernGpuAllocator(int32_t device_id = -1);
+
+/* Return an allocator for moderngpu.
+
+   Caution: The returned pointer is NOT owned by the caller and it
+   should NOT be freed!
+
+   @param  [in]  context  It is a CUDA context that will be used to
+                          allocate device memory for moderngpu.
+
+   @return  Return a pointer to mgpu::context_t. The user should NOT
+            free it.
+ */
+mgpu::context_t *GetModernGpuAllocator(ContextPtr context);
 
 }  // namespace k2
 

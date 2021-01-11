@@ -1,5 +1,5 @@
 # Copyright (c)  2020  Mobvoi Inc.        (authors: Fangjun Kuang)
-#                      Xiaomi Corp.   (author: Daniel Povey)
+#                      Xiaomi Corp.       (author: Daniel Povey, Haowen Qiu)
 #                      Guoguo Chen
 #
 # See ../../../LICENSE for clarification regarding multiple authors
@@ -10,89 +10,103 @@ from typing import Iterator
 from typing import Optional
 from typing import Tuple
 from typing import Union
-from . import fsa_properties
-from .autograd_utils import phantom_set_scores_to
 
+import os
+import shutil
 import torch
+
+import k2
+import k2.ragged
 import _k2
 
 from _k2 import RaggedArc
-from _k2 import _as_float
-from _k2 import _as_int
-from _k2 import _fsa_from_str
-from _k2 import _fsa_from_tensor
-from _k2 import _fsa_to_str
-from _k2 import _fsa_to_tensor
+from k2 import fsa_properties
 
 
 class Fsa(object):
     '''This class represents a single fsa or a vector of fsas.
 
     When it denotes a single FSA, its attribute :attr:`shape` is a tuple
-    containing two elements ``(num_states, None)``; when it represents
+    containing two elements `(num_states, None)`; when it represents
     a vector of FSAs it is a tuple with three
-    elements ``(num_fsas, None, None)``.  (Caution: it's possible
-    for a vector of FSAs to have zero or one elements).
+    elements `(num_fsas, None, None)`.
+
+    CAUTION:
+      It's possible for a vector of FSAs to have zero or one elements.
 
     An instance of FSA has the following attributes:
 
-    - ``arcs``: You will NOT use it directly in Python. It is an instance
-                of ``_k2.RaggedArc`` with only one method ``values()`` which
-                returns a 2-D `torch.Tensor`` of dtype ``torch.int32`` with 4
-                columns. Its number of rows indicates the number of arcs in the
-                FSA. The first column represents the source states, second
-                column the destination states, third column the labels and the
-                fourth column is the score. Note that the score is actually
-                a float number but it is **reinterpreted** as an integer.
+    arcs
+      You will NOT use it directly in Python. It is an instance of
+      `_k2.RaggedArc` with only one method `values()` which
+      returns a 2-D `torch.Tensor` of dtype `torch.int32` with 4
+      columns. Its number of rows indicates the number of arcs in the
+      FSA. The first column represents the source states, second
+      column the destination states, third column the labels and the
+      fourth column is the score. Note that the score is actually
+      a float number but it is **reinterpreted** as an integer.
 
-    - ``scores``: A 1-D ``torch.Tensor`` of dtype ``torch.float32``. It has
-                  as many entries as the number of arcs representing the score
-                  of every arc.
+    scores
+      A 1-D `torch.Tensor` of dtype `torch.float32`. It has
+      as many entries as the number of arcs representing the score
+      of every arc.
 
-    - ``labels``: A 1-D ``torch.Tensor`` of dtype ``torch.int32``. It has as
-                  many entries as the number of arcs representing the label of
-                  every arc.
+    labels
+      1-D `torch.Tensor` of dtype `torch.int32`. It has as
+      many entries as the number of arcs representing the label of
+      every arc.
 
 
     It MAY have the following attributes:
 
-    - ``symbols``: An instance of ``k2.SymbolTable``. It maps an entry in
-                   ``labels`` to an integer and vice versa. It is used for
-                   visualization only.
+    symbols
+      An instance of `k2.SymbolTable`. It maps an entry in
+      `labels` to an integer and vice versa. It is used for
+      visualization only.
 
-    - ``aux_labels`: A 1-D ``torch.Tensor`` of dtype ``torch.int32``. It has the
-                     same shape as ``labels``. NOTE: We will change it to a
-                     ragged tensor in the future.
+    aux_labels
+     A 1-D `torch.Tensor` of dtype `torch.int32` or a ragged tensor with type
+     `_k2.RaggedInt`. It contains auxiliary labels per arc.  If it's a tensor,
+     `aux_labels.numel()` equals to the number of arcs.  if it's
+     `_k2.RaggedInt`, then `aux_labels.dim0()` equals to the number of arcs.
 
-    - ``aux_symbols``: An instance of ``k2.SymbolTable. It maps an entry in
-                       ``aux_labels`` to an integer and vice versa.
+    aux_symbols
+      An instance of `k2.SymbolTable`. It maps an entry in
+      `aux_labels` to an integer and vice versa.
 
-    - ``properties``: An integer that encodes the properties of the FSA. It is
-                      accessed as fsa.properties (read-only!)
+    properties
+      An integer that encodes the properties of the FSA. It is
+      accessed as fsa.properties (read-only!)
 
     It MAY have other attributes that set by users.  Tensor attributes should
-    have the same 1st dimension as the number of arcs in the FSA.
+    have the same 1st dimension as the number of arcs in the FSA, Ragged
+    attributes should have the same `dim0` as the number of arcs in the FSA.
 
     CAUTION:
-      When an attribute is an instance of ``torch.Tensor``, its ``shape[0]``
+      When an attribute is an instance of `torch.Tensor`, its `shape[0]`
+      has to be equal to the number arcs. Otherwise, an assertion error
+      will be thrown.
+      When an attribute is an instance of `_k2.RaggedInt`, its `dim0()`
       has to be equal to the number arcs. Otherwise, an assertion error
       will be thrown.
 
     NOTE:
-      ``symbols`` and ``aux_symbols`` are symbol tables, while ``labels``
-      and ``aux_labels`` are instances of ``torch.Tensor``.
+      `symbols` and `aux_symbols` are symbol tables, while `labels`
+      is instances of `torch.Tensor` and `aux_labels` is instances of
+      `torch.Tensor` or `_k2.RaggedInt`.
 
       Implementation note: most of this class's attributes are not
-      real attributes in the objcet's dict; the real attributes are
-      'arcs', '_non_tensor_attr', '_tensor_attr', '_properties',
-      '_cache'.
+      real attributes in the object's dict; the real attributes are
+      `arcs`, `_non_tensor_attr`, `_tensor_attr`, `_properties`,
+      `_cache`.
 
     '''
 
-    def __init__(self,
-                 arcs: Union[torch.Tensor, RaggedArc],
-                 aux_labels: Optional[torch.Tensor] = None,
-                 properties=None) -> None:
+    def __init__(
+            self,
+            arcs: Union[torch.Tensor, RaggedArc],
+            aux_labels: Optional[Union[torch.Tensor, _k2.RaggedInt]] = None,
+            properties=None) -> None:
         '''Build an Fsa from a tensor with optional aux_labels.
 
         It is useful when loading an Fsa from file.
@@ -112,18 +126,20 @@ class Fsa(object):
           aux_labels:
             Optional. If not None, it associates an aux_label with every arc,
             so it has as many rows as `tensor`. It is a 1-D tensor of dtype
-            `torch.int32`.
+            `torch.int32` or `_k2.RaggedInt` whose `dim0()` equals to the
+            number of arcs.
 
           properties:
             Tensor properties if known (should only be provided by
             internal code, as they are not checked; intended for use
-            by Fsa.clone())
+            by `Fsa.clone()`)
 
         Returns:
           An instance of Fsa.
         '''
         if isinstance(arcs, torch.Tensor):
-            arcs: RaggedArc = _fsa_from_tensor(arcs)
+            arcs: RaggedArc = _k2.fsa_from_tensor(arcs)
+        assert isinstance(arcs, RaggedArc)
 
         # Accessing self.__dict__ bypasses __setattr__.
         self.__dict__['arcs'] = arcs
@@ -133,7 +149,9 @@ class Fsa(object):
         #     It saves attribute values of type torch.Tensor. `shape[0]` of
         #     attribute values have to be equal to the number of arcs
         #     in the FSA.  There are a couple of standard ones, 'aux_labels'
-        #     (present for transducers), and 'scores'.
+        #     (present for transducers), and 'scores'. It also saves
+        #     attribute values of type _k2.RaggedInt, e.g. `aux_labels` if
+        #     it has type of _k2.RaggedInt instead of torch.Tensor.
         #
         # - `_non_tensor_attr`
         #     It saves non-tensor attributes, e.g., :class:`SymbolTable`.
@@ -145,79 +163,136 @@ class Fsa(object):
         # The `_cache` dict contains the following attributes:
         #
         #  - `state_batches`:
-        #           returned by :func:`_k2._get_state_batches`
+        #           returned by :func:`_k2.get_state_batches`
         #  - `dest_states`:
-        #           returned by :func:`_k2._get_dest_states`
+        #           returned by :func:`_k2.get_dest_states`
         #  - `incoming_arcs`:
-        #           returned by :func:`_k2._get_incoming_arcs`
+        #           returned by :func:`_k2.get_incoming_arcs`
         #  - `entering_arc_batches`:
-        #           returned by :func:`_k2._get_entering_arc_index_batches`
+        #           returned by :func:`_k2.get_entering_arc_index_batches`
         #  - `leaving_arc_batches`:
-        #           returned by :func:`_k2._get_leaving_arc_index_batches`
+        #           returned by :func:`_k2.get_leaving_arc_index_batches`
         #  - `forward_scores_tropical`:
-        #           returned by :func:`_k2._get_forward_scores_float`
+        #           returned by :func:`_k2.get_forward_scores_float`
         #           with `log_semiring=False`
         #  - `forward_scores_log`:
-        #           returned by :func:`_k2._get_forward_scores_float` or
+        #           returned by :func:`_k2.get_forward_scores_float` or
         #           :func:`_get_forward_scores_double` with `log_semiring=True`
         #  - `tot_scores_tropical`:
-        #           returned by :func:`_k2._get_tot_scores_float` or
-        #           :func:`_k2._get_tot_scores_double` with
+        #           returned by :func:`_k2.get_tot_scores_float` or
+        #           :func:`_k2.get_tot_scores_double` with
         #           `forward_scores_tropical`.
         #  - `tot_scores_log`:
-        #           returned by :func:`_k2._get_tot_scores_float` or
-        #           :func:`_k2._get_tot_scores_double` with
+        #           returned by :func:`_k2.get_tot_scores_float` or
+        #           :func:`_k2.get_tot_scores_double` with
         #           `forward_scores_log`.
         #  - `backward_scores_tropical`:
-        #           returned by :func:`_k2._get_backward_scores_float` or
-        #           :func:`_k2._get_backward_scores_double` with
+        #           returned by :func:`_k2.get_backward_scores_float` or
+        #           :func:`_k2.get_backward_scores_double` with
         #           `log_semiring=False`
         #  - `backward_scores_log_semiring`:
-        #           returned by :func:`_k2._get_backward_scores_float` or
-        #           :func:`_k2._get_backward_scores_double` with
+        #           returned by :func:`_k2.get_backward_scores_float` or
+        #           :func:`_k2.get_backward_scores_double` with
         #           `log_semiring=True`
         #  - `entering_arcs`:
-        #           returned by :func:`_k2._get_forward_scores_float` or
+        #           returned by :func:`_k2.get_forward_scores_float` or
         #           :func:`_get_forward_scores_double` with `log_semiring=False`
 
         for name in ['_tensor_attr', '_non_tensor_attr', '_cache']:
             self.__dict__[name] = dict()
 
-        self._tensor_attr['scores'] = _as_float(self.arcs.values()[:, -1])
+        self._tensor_attr['scores'] = _k2.as_float(self.arcs.values()[:, -1])
         if aux_labels is not None:
-            self.aux_labels = aux_labels.to(torch.int32)
+            if isinstance(aux_labels, torch.Tensor):
+                self.aux_labels = aux_labels.to(torch.int32)
+            else:
+                # ragged tensor
+                self.aux_labels = aux_labels
         # Access the properties field (it's a @property, i.e. it has a
         # getter) which sets up the properties and also checks that
         # the FSA is valid.
         _ = self.properties
 
     def __str__(self) -> str:
-        '''Return a string representation of this object (note: does not
-           contain all the information in it for now)'''
-        if hasattr(self, 'aux_labels'):
+        '''Return a string representation of this object
+
+        For visualization and debug only.
+        '''
+        if hasattr(self, 'aux_labels') and isinstance(self.aux_labels,
+                                                      torch.Tensor):
             aux_labels = self.aux_labels.to(torch.int32)
         else:
             aux_labels = None
         if self.arcs.num_axes() == 2:
-            ans = "k2.Fsa: " + _fsa_to_str(self.arcs, False, aux_labels)
+            ans = 'k2.Fsa: ' + _k2.fsa_to_str(self.arcs, False, aux_labels)
         else:
-            ans = "k2.FsaVec: \n"
+            ans = 'k2.FsaVec: \n'
             for i in range(self.shape[0]):
                 # get the i-th Fsa
                 ragged_arc, start = self.arcs.index(0, i)
                 end = start + ragged_arc.values().shape[0]
-                ans += "FsaVec[" + str(i) + "]: " + _fsa_to_str(
+                ans += 'FsaVec[' + str(i) + ']: ' + _k2.fsa_to_str(
                     ragged_arc, False,
                     None if aux_labels is None else aux_labels[start:end])
-        ans += "properties_str = " + _k2.fsa_properties_as_str(
-            self._properties) + "."
+        ans += 'properties_str = ' + _k2.fsa_properties_as_str(
+            self._properties) + '.'
+        for name, value in self.named_tensor_attr(include_scores=False):
+            sep = '\n'
+            ans += f'{sep}{name}: {value}'
+        for name, value in self.named_non_tensor_attr():
+            if name == 'symbols':
+                continue
+            sep = '\n'
+            ans += f'{sep}{name}: {value}'
+
         return ans
+
+    def draw(self, filename: Optional[str],
+             title: Optional[str] = None) -> 'Digraph':  # noqa
+        '''
+        Render FSA as an image via graphviz, and return the Digraph object;
+        and optionally save to file `filename`.
+        `filename` must have a suffix that graphviz understands, such as
+        `pdf`, `svg` or `png`.
+
+        Args:
+           filename:
+              Filename to (optionally) save to, e.g. 'foo.png', 'foo.svg',
+              'foo.png'  (must have a suffix that graphviz understands).
+           title:
+              Title to be displayed in image, e.g. 'A simple FSA example'
+        '''
+
+        digraph = k2.utils.to_dot(self, title=title)
+
+        _, extension = os.path.splitext(filename)
+        if extension == '' or extension[0] != '.':
+            raise ValueError(
+                "Filename needs to have a suffix like .png, .pdf, .svg: {}".
+                format(filename))
+
+        if filename:
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                temp_fn = digraph.render(filename='temp',
+                                         directory=tmp_dir,
+                                         format=extension[1:],
+                                         cleanup=True)
+
+                shutil.move(temp_fn, filename)
+        return digraph
 
     def __setattr__(self, name: str, value: Any) -> None:
         '''
         Caution:
-          We save a reference to ``value``. If you need to change ``value``
+          We save a reference to `value`. If you need to change `value`
           afterwards, please consider passing a copy of it.
+
+        Args:
+          name:
+            Name of the attribute.
+          value:
+            Value of the attribute.
         '''
 
         assert name not in ('_tensor_attr', '_non_tensor_attr', 'arcs',
@@ -236,12 +311,20 @@ class Fsa(object):
                 assert value.dtype == torch.float32
                 # NOTE: we **reinterpret** the float patterns
                 # to integer patterns here.
-                self.arcs.values()[:, -1] = _as_int(value.detach())
+                self.arcs.values()[:, -1] = _k2.as_int(value.detach())
+        elif isinstance(value, _k2.RaggedInt):
+            assert value.dim0() == self.arcs.values().shape[0]
+            self._tensor_attr[name] = value
         else:
             self._non_tensor_attr[name] = value
 
     @property
     def labels(self) -> torch.Tensor:
+        '''Return the labels.
+
+        Returns:
+          Return a 1-D `torch.Tensor` with dtype `torch.int32`.
+        '''
         try:
             return self.arcs.values()[:, 2]
         except Exception as e:
@@ -253,7 +336,12 @@ class Fsa(object):
 
     @labels.setter
     def labels(self, values) -> None:
-        print("In labels setter")
+        '''Set labels.
+
+        Args:
+          values:
+            A 1-D `torch.tensor` with dtype `torch.int32`.
+        '''
         assert values.dtype == torch.int32
         self.arcs.values()[:, 2] = values
         # Invalidate the properties since we changed the labels.
@@ -275,7 +363,7 @@ class Fsa(object):
         self.__dict__['_properties'] = properties
         if properties & fsa_properties.VALID != 1:
             raise ValueError(
-                "Fsa is not valid, properties are: {} = {}, arcs are: {}".
+                'Fsa is not valid, properties are: {} = {}, arcs are: {}'.
                 format(properties, fsa_properties.to_str(properties),
                        str(self.arcs)))
         return properties
@@ -293,7 +381,7 @@ class Fsa(object):
         return self.scores.grad
 
     def __getattr__(self, name: str) -> Any:
-        """
+        '''
         Note: for attributes that exist as properties, e.g.
         self.labels, self.properties, self.requires_grad, we won't
         reach this code because Python checks the class dict before
@@ -302,7 +390,7 @@ class Fsa(object):
 
         The 'virtual' members of this class are those in self._tensor_attr
         and self._non_tensor_attr.
-        """
+        '''
         if name in self._tensor_attr:
             return self._tensor_attr[name]
         elif name in self._non_tensor_attr:
@@ -327,14 +415,14 @@ class Fsa(object):
         elif name in self._cache:
             del self._cache[name]
         else:
-            raise AttributeError("No such attribute in Fsa: " + name)
+            raise AttributeError('No such attribute in Fsa: ' + name)
 
     def get_state_batches(self) -> _k2.RaggedInt:
         '''Get (and compute if necessary) cached property self.state_batches.
            For use by internal k2 code.  Used in many algorithms.'''
         name, cache = 'state_batches', self._cache
         if name not in cache:
-            cache[name] = _k2._get_state_batches(self.arcs, transpose=True)
+            cache[name] = _k2.get_state_batches(self.arcs, transpose=True)
         return cache[name]
 
     def get_dest_states(self) -> torch.Tensor:
@@ -342,7 +430,7 @@ class Fsa(object):
            For use by internal k2 code, relates to best-path.'''
         name, cache = 'dest_states', self._cache
         if name not in cache:
-            cache[name] = _k2._get_dest_states(self.arcs, as_idx01=True)
+            cache[name] = _k2.get_dest_states(self.arcs, as_idx01=True)
         return cache[name]
 
     def get_incoming_arcs(self) -> _k2.RaggedInt:
@@ -350,8 +438,8 @@ class Fsa(object):
            For use by internal k2 code, relates to best-path'''
         name, cache = 'incoming_arcs', self._cache
         if name not in cache:
-            cache[name] = _k2._get_incoming_arcs(self.arcs,
-                                                 self.get_dest_states())
+            cache[name] = _k2.get_incoming_arcs(self.arcs,
+                                                self.get_dest_states())
         return cache[name]
 
     def get_entering_arc_batches(self) -> _k2.RaggedInt:
@@ -359,7 +447,7 @@ class Fsa(object):
            For use by internal k2 code, used in many algorithms.'''
         name, cache = 'entering_arc_batches', self._cache
         if name not in cache:
-            cache[name] = _k2._get_entering_arc_index_batches(
+            cache[name] = _k2.get_entering_arc_index_batches(
                 self.arcs,
                 incoming_arcs=self.get_incoming_arcs(),
                 state_batches=self.get_state_batches())
@@ -370,24 +458,31 @@ class Fsa(object):
            For use by internal k2 code, used in many algorithms.'''
         name, cache = 'leaving_arc_batches', self._cache
         if name not in cache:
-            cache[name] = _k2._get_leaving_arc_index_batches(
+            cache[name] = _k2.get_leaving_arc_index_batches(
                 self.arcs, self.get_state_batches())
         return cache[name]
 
-    def get_forward_scores_tropical(self, use_float_scores) -> torch.Tensor:
+    def get_forward_scores_tropical(self,
+                                    use_double_scores: bool) -> torch.Tensor:
         '''Get (and compute if necessary) cached property
         self.forward_scores_tropical.
 
         For use by internal k2 code, used in getting best-path or (tropical)
-        total-scores.  These are raw forward-scores and not differentiable.'''
-        name = 'forward_scores_tropical' + ('float'
-                                            if use_float_scores else 'double')
+        total-scores.  These are raw forward-scores and not differentiable.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
+        '''
+        name = 'forward_scores_tropical' + ('double'
+                                            if use_double_scores else 'float')
         cache = self._cache
         if name not in cache:
-            if use_float_scores:
-                func = _k2._get_forward_scores_float
+            if use_double_scores:
+                func = _k2.get_forward_scores_double
             else:
-                func = _k2._get_forward_scores_double
+                func = _k2.get_forward_scores_float
             forward_scores_tropical, entering_arcs = func(
                 self.arcs,
                 state_batches=self.get_state_batches(),
@@ -397,21 +492,26 @@ class Fsa(object):
             cache['entering_arcs'] = entering_arcs
         return cache[name]
 
-    def get_forward_scores_log(self, use_float_scores) -> torch.Tensor:
+    def get_forward_scores_log(self, use_double_scores: bool) -> torch.Tensor:
         '''Get (and compute if necessary) cached property
         self.forward_scores_log.
 
         For use by internal k2 code, used in getting total-score for
-        log semiring
+        log semiring.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
-        name = 'forward_scores_log' + ('float'
-                                       if use_float_scores else 'double')
+        name = 'forward_scores_log' + ('double'
+                                       if use_double_scores else 'float')
         cache = self._cache
         if name not in cache:
-            if use_float_scores:
-                func = _k2._get_forward_scores_float
+            if use_double_scores:
+                func = _k2.get_forward_scores_double
             else:
-                func = _k2._get_forward_scores_double
+                func = _k2.get_forward_scores_float
             cache[name], _ = func(
                 self.arcs,
                 state_batches=self.get_state_batches(),
@@ -419,61 +519,79 @@ class Fsa(object):
                 log_semiring=True)
         return cache[name]
 
-    def get_tot_scores_tropical(self, use_float_scores) -> torch.Tensor:
+    def get_tot_scores_tropical(self, use_double_scores: bool) -> torch.Tensor:
         '''Compute total-scores in tropical semiring (one per FSA), which is the same
-           as the best-path score.
-           CAUTION: these are just the raw total-scores and are
-           not differentiable.   Use k2.get_tot_scores(self) to
-           get differentiable total-scores.
+        as the best-path score.
+
+        CAUTION:
+          These are just the raw total-scores and are not differentiable.
+          Use `k2.get_tot_scores(self)` to get differentiable total-scores.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
-        name = 'tot_scores_tropical_' + ('float'
-                                         if use_float_scores else 'double')
+        name = 'tot_scores_tropical_' + ('double'
+                                         if use_double_scores else 'false')
         cache = self._cache
         if name not in cache:
-            if use_float_scores is True:
-                func = _k2._get_tot_scores_float
+            if use_double_scores is True:
+                func = _k2.get_tot_scores_double
             else:
-                func = _k2._get_tot_scores_double
+                func = _k2.get_tot_scores_float
             forward_scores_tropical = self.get_forward_scores_tropical(
-                use_float_scores)
+                use_double_scores)
             cache[name] = func(self.arcs, forward_scores_tropical)
         return cache[name]
 
-    def get_tot_scores_log(self, use_float_scores) -> torch.Tensor:
-        '''Compute total-scores in log semiring (one per FSA).
-           as the best-path score.
-           CAUTION: these are just the raw total-scores and are not
-           differentiable.  Use k2.get_tot_scores(self) to get differentiable
-           total-scores.
+    def get_tot_scores_log(self, use_double_scores: bool) -> torch.Tensor:
+        '''Compute total-scores in log semiring (one per FSA) as the
+        best-path score.
+
+        CAUTION:
+          These are just the raw total-scores and are not differentiable.
+          Use `k2.get_tot_scores(self)` to get differentiable total-scores.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
-        name = 'tot_scores_log_' + ('float' if use_float_scores else 'double')
+        name = 'tot_scores_log_' + ('double' if use_double_scores else 'float')
         cache = self._cache
         if name not in cache:
-            if use_float_scores is True:
-                func = _k2._get_tot_scores_float
+            if use_double_scores is True:
+                func = _k2.get_tot_scores_double
             else:
-                func = _k2._get_tot_scores_double
-            forward_scores_log = self.get_forward_scores_log(use_float_scores)
+                func = _k2.get_tot_scores_float
+            forward_scores_log = self.get_forward_scores_log(use_double_scores)
             cache[name] = func(self.arcs, forward_scores_log)
         return cache[name]
 
-    def get_backward_scores_tropical(self, use_float_scores) -> torch.Tensor:
+    def get_backward_scores_tropical(self,
+                                     use_double_scores: bool) -> torch.Tensor:
         '''Compute backward-scores in tropical semiring, i.e. best-path-to-end
-           costs.  For internal k2 use.  Not differentiable.
+        costs.  For internal k2 use.  Not differentiable.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
-        name = 'backward_scores_tropical_' + ('float' if use_float_scores else
-                                              'double')
+        name = 'backward_scores_tropical_' + ('double' if use_double_scores
+                                              else 'float')
         cache = self._cache
         if name not in cache:
-            if use_float_scores:
-                func = _k2._get_backward_scores_float
+            if use_double_scores:
+                func = _k2.get_backward_scores_double
             else:
-                func = _k2._get_backward_scores_double
+                func = _k2.get_backward_scores_float
 
             state_batches = self.get_state_batches()
             leaving_arc_batches = self.get_leaving_arc_batches()
             tot_scores_tropical = self.get_tot_scores_tropical(
-                use_float_scores)
+                use_double_scores)
             backward_scores_tropical = func(
                 self.arcs,
                 state_batches=state_batches,
@@ -483,22 +601,27 @@ class Fsa(object):
             cache[name] = backward_scores_tropical
         return cache[name]
 
-    def get_backward_scores_log(self, use_float_scores) -> torch.Tensor:
+    def get_backward_scores_log(self, use_double_scores: bool) -> torch.Tensor:
         '''Compute backward-scores in tropical semiring, i.e. total-score-to-end.
-           for each state.  For internal k2 use.  Not differentiable.
+        for each state.  For internal k2 use.  Not differentiable.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
-        name = 'backward_scores_log_' + ('float'
-                                         if use_float_scores else 'double')
+        name = 'backward_scores_log_' + ('double'
+                                         if use_double_scores else 'float')
         cache = self._cache
         if name not in cache:
-            if use_float_scores:
-                func = _k2._get_backward_scores_float
+            if use_double_scores:
+                func = _k2.get_backward_scores_double
             else:
-                func = _k2._get_backward_scores_double
+                func = _k2.get_backward_scores_float
 
             state_batches = self.get_state_batches()
             leaving_arc_batches = self.get_leaving_arc_batches()
-            tot_scores_log = self.get_tot_scores_log(use_float_scores)
+            tot_scores_log = self.get_tot_scores_log(use_double_scores)
             cache[name] = func(self.arcs,
                                state_batches=state_batches,
                                leaving_arc_batches=leaving_arc_batches,
@@ -506,14 +629,19 @@ class Fsa(object):
                                log_semiring=True)
         return cache[name]
 
-    def get_entering_arcs(self, use_float_scores) -> torch.Tensor:
+    def get_entering_arcs(self, use_double_scores: bool) -> torch.Tensor:
         '''Compute, for each state, the index of the best arc entering it.
-           For internal k2 use.
+        For internal k2 use.
+
+        Args:
+          use_double_scores:
+            True to use `double precision` floating point.
+            False to use `single precision`.
         '''
         name, cache = 'entering_arcs', self._cache
         if name not in cache:
             # the following will set self._cache['entering_arcs']
-            self.get_forward_scores_tropical(use_float_scores)
+            self.get_forward_scores_tropical(use_double_scores)
         return cache[name]
 
     def requires_grad_(self, requires_grad: bool) -> 'Fsa':
@@ -523,7 +651,7 @@ class Fsa(object):
         Returns this FSA.
         You can test whether this object has the requires_grad property
         true or false by accessing self.requires_grad (handled in
-        __getattr__).
+        `__getattr__`).
 
         Caution:
           This is an **in-place** operation as you can see that the function
@@ -540,23 +668,26 @@ class Fsa(object):
         return self
 
     def invert_(self) -> 'Fsa':
-        '''Swap the ``labels`` and ``aux_labels``.
+        '''Swap the `labels` and `aux_labels`.
 
-        If there are symbol tables associated with ``labels`` and
-        ``aux_labels``, they are also swapped.
+        If there are symbol tables associated with `labels` and
+        `aux_labels`, they are also swapped.
 
-        It is an error if the FSA contains no ``aux_labels``.
+        It is an error if the FSA contains no `aux_labels`.
 
         CAUTION:
           The function name ends with an underscore which means this
           is an **in-place** operation.
 
         Returns:
-          Return ``self``.
+          Return `self`.
         '''
         if not hasattr(self, 'aux_labels'):
             raise RuntimeError(
-                "invert_ cannot be called on acceptors (no aux_labels)")
+                'invert_ cannot be called on acceptors (no aux_labels)')
+        if not isinstance(self.aux_labels, torch.Tensor):
+            raise RuntimeError('current invert_ method only supports case '
+                               'where aux_labels is a tensor')
 
         aux_labels = self.aux_labels
         self.aux_labels = self.labels.clone()
@@ -579,6 +710,16 @@ class Fsa(object):
         return self
 
     def invert(self) -> 'Fsa':
+        '''Swap the `labels` and `aux_labels`.
+
+        If there are symbol tables associated with `labels` and
+        `aux_labels`, they are also swapped.
+
+        It is an error if the FSA contains no `aux_labels`.
+
+        Returns:
+          Return a new Fsa.
+        '''
         return self.clone().invert_()
 
     def is_cpu(self) -> bool:
@@ -587,7 +728,7 @@ class Fsa(object):
         Returns:
           True if the FSA is on CPU; False otherwise.
         '''
-        return self.arcs.is_cpu()
+        return self.device.type == 'cpu'
 
     def is_cuda(self) -> bool:
         '''Return true if this FSA is on GPU.
@@ -595,7 +736,7 @@ class Fsa(object):
         Returns:
           True if the FSA is on GPU; False otherwise.
         '''
-        return self.arcs.is_cuda()
+        return self.device.type == 'cuda'
 
     @property
     def device(self) -> torch.device:
@@ -618,14 +759,20 @@ class Fsa(object):
 
         out_fsa = Fsa(ragged_arc)
         for name, value in self.named_tensor_attr(include_scores=False):
-            setattr(out_fsa, name, value[start:end])
+            if isinstance(value, torch.Tensor):
+                setattr(out_fsa, name, value[start:end])
+            else:
+                assert isinstance(value, _k2.RaggedInt)
+                setattr(out_fsa, name,
+                        _k2.ragged_int_arange(value, 0, start, end))
 
         for name, value in self.named_non_tensor_attr():
             setattr(out_fsa, name, value)
 
         # The following is a magic invocation to make sure
         # the backprop on the scores happens.
-        phantom_set_scores_to(out_fsa, self.scores[start:end])
+        k2.autograd_utils.phantom_set_scores_to(out_fsa,
+                                                self.scores[start:end])
 
         return out_fsa
 
@@ -636,38 +783,55 @@ class Fsa(object):
            A more convenient way to serialize a Tensor is to use `as_dict`
            and `from_dict`
         '''
-        return _fsa_to_tensor(self.arcs)
+        return _k2.fsa_to_tensor(self.arcs)
 
     def as_dict(self) -> Dict[str, Any]:
         '''Convert this Fsa to a dict (probably for purposes of serialization
-          with, e.g., torch.save).
+        , e.g., torch.save).
+
+        Caution:
+          `self.requires_grad` attribute is not saved.
+        Returns:
+          A `dict` that can be used to reconstruct this FSA by using
+          `Fsa.from_dict`.
         '''
         ans = dict()
-        ans['arcs'] = _fsa_to_tensor(self.arcs)
-        if hasattr(self, 'aux_labels'):
-            ans['aux_labels'] = self.aux_labels
-        # TODO(dan): add other properties, e.g. from _tensor_attr and
-        # _non_tensor_attr.
+        ans['arcs'] = _k2.fsa_to_tensor(self.arcs)
+
+        for name, value in self.named_tensor_attr(include_scores=False):
+            ans[name] = value
+
+        for name, value in self.named_non_tensor_attr():
+            ans[name] = value
+
         return ans
 
     @classmethod
     def from_dict(cls, dict_in: Dict[str, Any]) -> 'Fsa':
-        # TODO(dan): deal with other properties, e.g. that will go to from
-        # _tensor_attr and _non_tensor_attr.
-        return Fsa(dict_in['arcs'], aux_labels=dict_in.get('aux_labels', None))
+        fsa = Fsa(dict_in['arcs'], aux_labels=dict_in.get('aux_labels', None))
+        for key, value in dict_in.items():
+            if key in ['arcs', 'aux_labels']:
+                continue
+            setattr(fsa, key, value)
+        return fsa
 
-    def to(self, device: torch.device) -> 'Fsa':
+    def to(self, device: Union[str, torch.device]) -> 'Fsa':
         '''Move the FSA onto a given device.
 
         Args:
           device:
-            An instance of `torch.device`. It supports only cpu and cuda.
+            An instance of `torch.device` or a string that can be used to
+            construct a `torch.device`, e.g., 'cpu', 'cuda:0'.
+            It supports only cpu and cuda devices.
 
         Returns:
           Returns a new Fsa which is this object copied to the given device
-         (or this object itself, if the device was the same)
+          (or this object itself, if the device was the same)
         '''
         # Keep this code in sync with that in clone()
+        if isinstance(device, str):
+            device = torch.device(device)
+
         assert device.type in ('cpu', 'cuda')
         if device == self.scores.device:
             return self
@@ -685,16 +849,16 @@ class Fsa(object):
 
         # The following is a magic invocation to make sure
         # the backprop happens.
-        phantom_set_scores_to(ans, self.scores.to(device))
+        k2.autograd_utils.phantom_set_scores_to(ans, self.scores.to(device))
 
         return ans
 
     def clone(self) -> 'Fsa':
-        """
+        '''
         Return an Fsa that is a clone of this one, i.e. a close approximation
         to what you'd get if you did .clone() on all its tensor members.
         Any non-tensor attributes are copied over.
-        """
+        '''
         # Keep this code in sync with that in to()
         ans = Fsa(self.arcs.clone(), properties=self.properties)
 
@@ -714,16 +878,16 @@ class Fsa(object):
 
         # The following is a magic invocation to make sure
         # the backprop happens.
-        phantom_set_scores_to(ans, self.scores)
+        k2.autograd_utils.phantom_set_scores_to(ans, self.scores)
 
         return ans
 
     def detach(self) -> 'Fsa':
-        """
+        '''
         Return an Fsa that shares the underlying data with this one,
         except gradients are not tracked.
         Any non-tensor attributes are copied over.
-        """
+        '''
         ans = Fsa(self.arcs, properties=self.properties)
 
         for name, value in self.named_tensor_attr(include_scores=False):
@@ -771,8 +935,8 @@ class Fsa(object):
     def shape(self) -> Tuple[int, ...]:
         '''
         Returns:
-          ``(num_states, None)`` if this is an Fsa;
-          ``(num_fsas, None, None)`` if this is an FsaVec.
+          `(num_states, None)` if this is an Fsa;
+          `(num_fsas, None, None)` if this is an FsaVec.
         '''
         if self.arcs.num_axes() == 2:
             return (self.arcs.dim0(), None)
@@ -788,15 +952,15 @@ class Fsa(object):
 
         The given string `s` consists of lines with the following format:
 
-        (1) When it represents an acceptor:
+        (1) When it represents an acceptor::
 
                 src_state dest_state label score
 
-        (2) When it represents a transducer:
+        (2) When it represents a transducer::
 
                 src_state dest_state label aux_label score
 
-        The line for the final state consists of only one field:
+        The line for the final state consists of only one field::
 
                 final_state
 
@@ -808,9 +972,10 @@ class Fsa(object):
           The first column has to be non-decreasing.
 
         Caution:
-          The final state has the largest state number. There is only
-          one final state. All arcs that are connected to the final state
-          have label -1.
+          The final state has the largest state number. There is **ONLY**
+          ONE final state. All arcs that are connected to the final state
+          have label -1. If there are aux_labels, they are also -1 for
+          arcs entering the final state.
 
         Args:
           s:
@@ -823,7 +988,7 @@ class Fsa(object):
         assert len(fields) == 4 or len(fields) == 5
         if len(fields) == 5:
             acceptor = False
-        arcs, aux_labels = _fsa_from_str(s, acceptor, False)
+        arcs, aux_labels = _k2.fsa_from_str(s, acceptor, False)
         ans = Fsa(arcs, aux_labels=aux_labels)
         return ans
 
@@ -833,15 +998,15 @@ class Fsa(object):
 
         The given string `s` consists of lines with the following format:
 
-        (1) When it represents an acceptor:
+        (1) When it represents an acceptor::
 
                 src_state dest_state label score
 
-        (2) When it represents a transducer:
+        (2) When it represents a transducer::
 
                 src_state dest_state label aux_label score
 
-        The line for the final state consists of two fields:
+        The line for the final state consists of two fields::
 
                 final_state score
 
@@ -859,5 +1024,31 @@ class Fsa(object):
             Optional. If true, interpret the input string as an acceptor;
             otherwise, interpret it as a transducer.
         '''
-        arcs, aux_labels = _fsa_from_str(s, acceptor, True)
+        arcs, aux_labels = _k2.fsa_from_str(s, acceptor, True)
         return Fsa(arcs, aux_labels=aux_labels)
+
+    def set_scores_stochastic_(self, scores) -> None:
+        '''Normalize the given `scores` and assign it to `self.scores`.
+
+        Args:
+          scores:
+            Tensor of scores of dtype torch.float32, and shape equal to
+            `self.scores.shape` (one axis). Will be normalized so the
+            sum, after exponentiating, of the scores leaving each state
+            that has at least one arc leaving it is 1.
+
+        Caution:
+          The function name ends with an underline indicating this function
+          will modify `self` **in-place**.
+        '''
+        assert scores.ndim == 1
+        assert scores.dtype == torch.float32
+        assert scores.numel() == self.scores.numel()
+
+        ragged_scores = k2.ragged.RaggedFloat(
+            self.arcs.shape().to(scores.device), scores)
+        ragged_scores = k2.ragged.normalize_scores(ragged_scores)
+
+        # Note we use `to` here since `scores` and `self.scores` may not
+        # be on the same device.
+        self.scores = ragged_scores.values.to(self.scores.device)

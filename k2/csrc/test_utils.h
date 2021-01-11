@@ -25,25 +25,14 @@
 
 namespace k2 {
 
-// clang-format off
-bool operator==(const Arc &a, const Arc &b) {
-  return a.src_state == b.src_state && \
-         a.dest_state == b.dest_state && \
-         a.label == b.label && \
-         fabs(a.score - b.score) < 1e-6;
-}
-// clang-format on
-
 template <typename T>
 void CheckArrayData(const Array1<T> &array, const std::vector<T> &target) {
   ASSERT_EQ(array.Dim(), target.size());
   const T *array_data = array.Data();
   // copy data from CPU/GPU to CPU
-  auto kind = GetMemoryCopyKind(*array.Context(), *GetCpuContext());
   std::vector<T> cpu_data(array.Dim());
-  MemoryCopy(static_cast<void *>(cpu_data.data()),
-             static_cast<const void *>(array_data),
-             array.Dim() * array.ElementSize(), kind, nullptr);
+  array.Context()->CopyDataTo(array.Dim() * array.ElementSize(), array_data,
+                              GetCpuContext(), cpu_data.data());
   EXPECT_EQ(cpu_data, target);
 }
 
@@ -108,6 +97,22 @@ void CheckRowSplits(RaggedShape &shape,
 
 // Return a random acyclic FSA that is NOT topo sorted
 Fsa GetRandFsa();
+
+/* Return 1-D array filled with random values.
+
+   @param [in] context  The device context specifying where the returned
+                        array resides.
+   @param [in] allow_minus_one
+                        If true, the returned array will contain values
+                        in the range [-1, max_value]; [0, max_value] otherwise.
+   @param [in] dim        It specifies the length of the returned array.
+   @param [in] max_value  It specifies the maximum value the returned array can
+                          contain.
+
+   @return  Return a 1-D array with the given `dim`.
+ */
+Array1<int32_t> GenerateRandomIndexes(ContextPtr context, bool allow_minus_one,
+                                      int32_t dim, int32_t max_value);
 
 }  // namespace k2
 

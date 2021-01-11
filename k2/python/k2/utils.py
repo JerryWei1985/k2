@@ -3,17 +3,14 @@
 #
 # See ../../../LICENSE for clarification regarding multiple authors
 
-from typing import List
 from typing import Optional
+from typing import Union
 
 import torch
 
+import _k2
 from .fsa import Fsa
-from _k2 import _create_fsa_vec
-from _k2 import _fsa_to_str
-from _k2 import _fsa_to_tensor
-from _k2 import _is_rand_equivalent
-from graphviz import Digraph
+from .symbol_table import SymbolTable
 
 
 def to_str(fsa: Fsa, openfst: bool = False) -> str:
@@ -33,7 +30,7 @@ def to_str(fsa: Fsa, openfst: bool = False) -> str:
         aux_labels = fsa.aux_labels.to(torch.int32)
     else:
         aux_labels = None
-    return _fsa_to_str(fsa.arcs, openfst, aux_labels)
+    return _k2.fsa_to_str(fsa.arcs, openfst, aux_labels)
 
 
 def to_tensor(fsa: Fsa) -> torch.Tensor:
@@ -50,18 +47,17 @@ def to_tensor(fsa: Fsa) -> torch.Tensor:
       fsa:
         The input Fsa.
     Returns:
-      A ``torch.Tensor`` of dtype ``torch.int32``. It is a 2-D tensor
+      A `torch.Tensor` of dtype `torch.int32`. It is a 2-D tensor
       if the input is a single FSA. It is a 1-D tensor if the input
       is a vector of FSAs.
     '''
-    return _fsa_to_tensor(fsa.arcs)
+    return _k2.fsa_to_tensor(fsa.arcs)
 
 
-def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
+def to_dot(fsa: Fsa, title: Optional[str] = None) -> 'Digraph':  # noqa
     '''Visualize an Fsa via graphviz.
 
     Note:
-      The type hint for the return value is omitted.
       Graphviz is needed only when this function is called.
 
     Args:
@@ -73,6 +69,15 @@ def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
     Returns:
       a Diagraph from grahpviz.
     '''
+
+    try:
+        import graphviz
+    except Exception:
+        print(
+            'You cannot use `to_dot` unless the graphviz package is installed.'
+        )
+        raise
+
     assert len(fsa.shape) == 2, 'FsaVec is not supported'
     if hasattr(fsa, 'aux_labels'):
         aux_labels = fsa.aux_labels
@@ -80,6 +85,48 @@ def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
     else:
         aux_labels = None
         name = 'WFSA'
+
+    def convert_aux_label_to_symbol(
+            aux_labels: Union[torch.Tensor, _k2.RaggedInt],
+            arc_index: int,
+            symbols: Optional[SymbolTable] = None) -> str:
+        '''Convert aux_label(s) to symbol(s).
+
+        Args:
+          aux_labels:
+            The aux_labels of an FSA.
+          arc_index:
+            The index of the arc.
+          symbols:
+            Symbol table of the FSA associated with the `aux_labels`.
+        Returns:
+          If `aux_labels` is a torch.Tensor, it returns a single string.
+          If `aux_labels` is a ragged tensor, it returns a string with symbols
+          separated by a space.
+        '''
+        if isinstance(aux_labels, torch.Tensor):
+            ans = int(aux_labels[arc_index])
+            if ans != -1 and symbols is not None:
+                ans = symbols[ans]
+            return f':{ans}'
+        assert isinstance(aux_labels, _k2.RaggedInt)
+        assert aux_labels.num_axes() == 2
+        row_splits = aux_labels.row_splits(1).cpu()
+        begin = row_splits[arc_index]
+        end = row_splits[arc_index + 1]
+        if end == begin:
+            return ':<eps>'
+
+        labels = aux_labels.values()[begin:end]
+        ans = []
+        for label in labels.tolist():
+            if label == -1:
+                ans.append('-1')
+            elif symbols is not None:
+                ans.append(symbols[label])
+            else:
+                ans.append(f'{label}')
+        return f':{" ".join(ans)}'
 
     graph_attr = {
         'rankdir': 'LR',
@@ -105,7 +152,7 @@ def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
     }
 
     final_state = -1
-    dot = Digraph(name=name, graph_attr=graph_attr)
+    dot = graphviz.Digraph(name=name, graph_attr=graph_attr)
 
     seen = set()
     i = -1
@@ -129,12 +176,12 @@ def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
                 dot.node(dst_state, label=dst_state, **default_node_attr)
             seen.add(dst_state)
         if aux_labels is not None:
-            aux_label = int(aux_labels[i])
-            if hasattr(fsa, 'aux_symbols') and aux_label != -1:
-                aux_label = fsa.aux_symbols.get(aux_label)
-                if aux_label == '<eps>':
-                    aux_label = 'ε'
-            aux_label = f':{aux_label}'
+            if hasattr(fsa, 'aux_symbols'):
+                aux_label = convert_aux_label_to_symbol(
+                    aux_labels, i, fsa.aux_symbols)
+            else:
+                aux_label = convert_aux_label_to_symbol(aux_labels, i, None)
+            aux_label = aux_label.replace('<eps>', 'ε')
         else:
             aux_label = ''
 
@@ -148,17 +195,17 @@ def to_dot(fsa: Fsa, title: Optional[str] = None) -> Digraph:
     return dot
 
 
-def create_fsa_vec(fsas: List[Fsa]) -> Fsa:
+def create_fsa_vec(fsas):
     '''Create an FsaVec from a list of FSAs
 
     We use the following rules to set the attributes of the output FsaVec:
 
     - For tensor attributes, we assume that all input FSAs have the same
-    attribute name and the values are concatenated.
+      attribute name and the values are concatenated.
 
     - For non-tensor attributes, if any two of the input FSAs have the same
-    attribute name, then we assume that their attribute values are equal and
-    the output FSA will inherit the attribute.
+      attribute name, then we assume that their attribute values are equal and
+      the output FSA will inherit the attribute.
 
     Args:
       fsas:
@@ -172,7 +219,7 @@ def create_fsa_vec(fsas: List[Fsa]) -> Fsa:
         assert len(fsa.shape) == 2
         ragged_arc_list.append(fsa.arcs)
 
-    ragged_arcs = _create_fsa_vec(ragged_arc_list)
+    ragged_arcs = _k2.create_fsa_vec(ragged_arc_list)
     fsa_vec = Fsa(ragged_arcs)
 
     tensor_attr_names = set(
@@ -209,10 +256,10 @@ def is_rand_equivalent(a: Fsa,
                        delta: float = 1e-6,
                        npath: int = 100) -> bool:
     '''Check if the Fsa `a` appears to be equivalent to `b` by
-       randomly checking some symbol sequences in them.
+    randomly checking some symbol sequences in them.
 
     Caution:
-      It only works on for CPU.
+      It works only on CPU.
 
     Args:
       a:
@@ -249,5 +296,5 @@ def is_rand_equivalent(a: Fsa,
        sequence exists in the other one and if the total weight for that symbol
        sequence is the same in both FSAs.
     '''
-    return _is_rand_equivalent(a.arcs, b.arcs, log_semiring, beam,
-                               treat_epsilons_specially, delta, npath)
+    return _k2.is_rand_equivalent(a.arcs, b.arcs, log_semiring, beam,
+                                  treat_epsilons_specially, delta, npath)

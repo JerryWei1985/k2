@@ -137,7 +137,7 @@ namespace k2 {
            idx0x_next = t.row_splits1[idx0 + 1],
            idx0xx = t.row_splits2[idx0x],
            idx0xx_next = t.row_splits2[idx0x_next],
-           size_0xx = idx0xx_next - idx0xx
+           len12 = idx0xx_next - idx0xx
      (The _next suffix is used when we're querying the most specific known index
      plus one, in this case index 0 but for instance, idx01x_next would mean
      that we were querying idx01x after incrementing the index on axis 1.)
@@ -150,7 +150,7 @@ namespace k2 {
         int32_t idx0, idx1, idx2;  # provided
         int32_t idx0x = t.row_splits1[idx0],
             idx01 = idx0x + idx1,
-            idx01x = t.row_splits2[idx1],
+            idx01x = t.row_splits2[idx01],
             idx012 = idx01x + idx2,
             idx0xx = t.row_splits2[idx0x],
             idx12 = idx012 - idx0xx;
@@ -198,7 +198,7 @@ namespace k2 {
   10 15 ].
  */
 template <typename SrcPtr, typename DestPtr>
-void ExclusiveSum(ContextPtr &c, int32_t n, SrcPtr src, DestPtr dest);
+void ExclusiveSum(ContextPtr c, int32_t n, SrcPtr src, DestPtr dest);
 
 /* Return the maximum value of the device array 't'.  Note: the sum will be
    initialized with T(0).
@@ -208,7 +208,7 @@ void ExclusiveSum(ContextPtr &c, int32_t n, SrcPtr src, DestPtr dest);
    additional cost.
  */
 template <typename T>
-T MaxValue(ContextPtr &c, int32_t nelems, const T *t);
+T MaxValue(ContextPtr c, int32_t nelems, const T *t);
 
 /*
   This is a rather special purpose function that is used in RaggedShape.
@@ -237,7 +237,7 @@ T MaxValue(ContextPtr &c, int32_t nelems, const T *t);
    Note: there is another function of the same name using the Array1 interface,
    declared in array_ops.h, that may be more convenient.
 */
-void RowSplitsToRowIds(ContextPtr &c, int32_t num_rows,
+void RowSplitsToRowIds(ContextPtr c, int32_t num_rows,
                        const int32_t *row_splits, int32_t num_elems,
                        int32_t *row_ids);
 
@@ -303,7 +303,7 @@ RowIdFromRowSplits(int32_t num_rows, const int32_t *row_splits, int32_t index,
    Note: there is another function of the same name using the Array1 interface,
    declared in array_ops.h, that may be more convenient.
  */
-void RowIdsToRowSplits(ContextPtr &c, int32_t num_elems, const int32_t *row_ids,
+void RowIdsToRowSplits(ContextPtr c, int32_t num_elems, const int32_t *row_ids,
                        bool no_empty_rows, int32_t num_rows,
                        int32_t *row_splits);
 
@@ -370,6 +370,29 @@ __global__ void eval_lambda_redirect(int32_t num_jobs, TaskRedirect *redirect,
   int32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x,
           num_threads = gridDim.x * blockDim.x,
           job_id = thread_idx / num_threads_per_job,
+          thread_this_job = thread_idx % num_threads_per_job;
+
+  if (job_id >= num_jobs) return;
+  K2_CHECK_GE(num_threads / num_threads_per_job, num_jobs);
+
+  int32_t task_id = redirect[job_id].task_id;
+  int32_t num_threads_this_task =
+      num_threads_per_job * redirect[job_id].num_jobs_this_task;
+  int32_t thread_idx_of_task =
+      redirect[job_id].job_id_this_task * num_threads_per_job + thread_this_job;
+  lambda(task_id, num_threads_this_task, thread_idx_of_task);
+}
+
+
+template <typename LambdaT>
+__global__ void eval_lambda_redirect_large(int32_t num_jobs,
+                                           TaskRedirect *redirect,
+                                           int32_t num_threads_per_job,
+                                           LambdaT lambda) {
+  int32_t thread_idx = (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x
+                       + threadIdx.x,
+          num_threads = gridDim.x * gridDim.y * blockDim.x,
+              job_id = thread_idx / num_threads_per_job,
           thread_this_job = thread_idx % num_threads_per_job;
 
   if (job_id >= num_jobs) return;
@@ -452,12 +475,22 @@ void EvalWithRedirect(cudaStream_t stream, int32_t num_jobs,
   } else {
     num_threads_per_job =
         RoundUpToNearestPowerOfTwo(num_threads_per_job / target_num_loops);
+    if (num_threads_per_job < 1)
+      num_threads_per_job = 1;
     int32_t tot_threads = num_threads_per_job * num_jobs;
     int32_t block_size = 256;
     int32_t grid_size = NumBlocks(tot_threads, block_size);
-    K2_CUDA_SAFE_CALL(eval_lambda_redirect<LambdaT>
-                      <<<grid_size, block_size, 0, stream>>>(
-                          num_jobs, redirect, num_threads_per_job, lambda));
+    if (grid_size < 65536) {
+      K2_CUDA_SAFE_CALL(eval_lambda_redirect<LambdaT>
+                        <<<grid_size, block_size, 0, stream>>>(
+                            num_jobs, redirect, num_threads_per_job, lambda));
+    } else {
+      dim3 grid_dim(4096, NumBlocks(grid_size, 4096), 1),
+          block_dim(block_size, 1, 1);
+      K2_CUDA_SAFE_CALL(eval_lambda_redirect_large<LambdaT>
+                        <<<grid_dim, block_dim, 0, stream>>>(
+                            num_jobs, redirect, num_threads_per_job, lambda));
+    }
   }
 }
 
@@ -480,13 +513,6 @@ __host__ __device__ __forceinline__ float IntAsFloat(int32_t i) {
 }
 
 /* Atomically decrement *i and return true if it is zero after the decrement (it
-is an error if it was less than zero).  This is the host version, without
-synchronization
-   (
-__host__ __forceinline__ bool AtomicDecAndCompareZero(int32_t *i) {
-}
-
-/* Atomically decrement *i and return true if it is zero after the decrement (it
    is an error if it becomes less than zero).
 */
 __host__ __device__ __forceinline__ bool AtomicDecAndCompareZero(int32_t *i) {
@@ -500,6 +526,53 @@ __host__ __device__ __forceinline__ bool AtomicDecAndCompareZero(int32_t *i) {
   *i = i_value - 1;
   K2_CHECK_GE(i_value - 1, 0);
   return i_value - 1 == 0;
+#endif
+}
+
+/* Add a value to a memory address atomically.
+
+   It implements `*address += value`.
+
+   CAUTION: For host code, we assume single-threaded for now.
+
+   @param  [inout]  address  The memory address.
+   @param  in]      value    The value to be added.
+ */
+template <typename T>
+__host__ __device__ __forceinline__ void AtomicAdd(T *address, T value) {
+#ifdef __CUDA_ARCH__
+  atomicAdd(address, value);
+#else
+  // For host code, we assume single-threaded for now).
+  *address += value;
+#endif
+}
+
+// atomicAdd() for double-precision floating-point numbers is not available on
+// devices with compute capability lower than 6.0.
+// The following implementation is copied from
+// https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#atomic-functions
+__host__ __device__ __forceinline__ void AtomicAdd(double *address,
+                                                   double value) {
+#if __CUDA_ARCH__ >= 600
+  atomicAdd(address, value);
+#elif defined(__CUDA_ARCH__)
+  // clang-format off
+  unsigned long long int *address_as_ull = reinterpret_cast<unsigned long long int *>(address);  // NOLINT
+  unsigned long long int old = *address_as_ull;  // NOLINT
+  unsigned long long int assumed;  // NOLINT
+  // clang-format on
+  do {
+    assumed = old;
+    old =
+        atomicCAS(address_as_ull, assumed,
+                  __double_as_longlong(value + __longlong_as_double(assumed)));
+    // Note: uses integer comparison to avoid hang in case of NaN
+    // (since NaN != NaN)
+  } while (assumed != old);
+#else
+  // For host code, we assume single-threaded for now).
+  *address += value;
 #endif
 }
 
@@ -518,13 +591,17 @@ __host__ __device__ __forceinline__ float OrderedIntToFloat(int32_t i) {
 }
 
 /*
-  Host version of Cuda's atomicMax function, marked __host__ (the default) for
+  host version of Cuda's atomicMax function, marked __host__ (the default) for
   clarity.  So we can use this in lambdas that run on both host and device.
  */
-__host__ __forceinline__ int32_t atomicMax(int32_t *address, int32_t val) {
+__host__ __device__ __forceinline__ int32_t AtomicMax(int32_t *address, int32_t val) {
+#if defined(__CUDA_ARCH__)
+  return atomicMax(address, val);
+#else
   int32_t old = *address;
   if (old < val) *address = val;
   return old;
+#endif
 }
 
 // have to figure out if there's a better place to put this
@@ -553,10 +630,26 @@ struct MinOp {
 };
 
 template <typename T>
-struct SumOp {
+struct PlusOp {
   __host__ __device__ __forceinline__ T operator()(const T &a,
                                                    const T &b) const {
     return a + b;
+  }
+};
+
+template <typename T>
+struct MinusOp {
+  __host__ __device__ __forceinline__ T operator()(const T &a,
+                                                   const T &b) const {
+    return a - b;
+  }
+};
+
+template <typename T>
+struct TimesOp {
+  __host__ __device__ __forceinline__ T operator()(const T &a,
+                                                   const T &b) const {
+    return a * b;
   }
 };
 
@@ -581,6 +674,14 @@ struct LessThan {
   __host__ __device__ __forceinline__ bool operator()(const T &a,
                                                       const T &b) const {
     return a < b;
+  }
+};
+
+template <typename T>
+struct GreaterThan {
+  __host__ __device__ __forceinline__ bool operator()(const T &a,
+                                                      const T &b) const {
+    return a > b;
   }
 };
 

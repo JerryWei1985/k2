@@ -198,6 +198,14 @@ Ragged<int32_t> GetIncomingArcs(FsaVec &fsas,
                                 const Array1<int32_t> &dest_states);
 
 /*
+  Rearrange an FsaVec into a different arrangement of arcs which will actually
+  not be a valid FsaVec but will contain the same information in a different
+  form.. the arcs are rearranged so they are listed by the dest_state, not
+  src_state.  Implementation is 2 lines, using GetIncomingArcs().
+ */
+FsaVec GetIncomingFsaVec(FsaVec &fsas);
+
+/*
    Compute and return forward scores per state (like alphas in Baum-Welch),
    or forward best-path scores if log_semiring == false.
 
@@ -406,14 +414,52 @@ Ragged<int32_t> GetStartStates(FsaVec &src);
 /* Create a FsaVec from a tensor of best arc indexes returned by `ShortestPath`.
 
    @param [in] fsas   Input FsaVec. It must be the same FsaVec for getting
-                      `best_arc_indexes`.
-   @param [in] best_arc_indexes
-                      It is returned by `ShortestPath`.
+                     `best_arc_indexes`.
+   @param [in] best_arc_index
+                      As returned by `ShortestPath`; has 2 axes, indexed
+                      [fsa_idx][list of arcs]
 
 
    @return returns a linear FsaVec that contains the best path of `fsas`.
  */
 FsaVec FsaVecFromArcIndexes(FsaVec &fsas, Ragged<int32_t> &best_arc_indexes);
+
+/*
+  Compose arc maps from two successive FSA operations which give arc maps as
+  type ragged tensor.
+
+   @param [in] step1_arc_map   Arc map from the first Fsa operation.
+                               Must have NumAxes() == 2.
+   @param [in] step2_arc_map   Arc map from the second Fsa operation.
+                         The elements in it are indexes into `step1_arc_map`,
+                         so we require that
+                         `0 <= step2_arc_map.values[i] < step1_arc_map.Dim0()`
+                         for `0 <= i < step2_arc_map.NumElements()`.
+                         Must have NumAxes() == 2 and have the same device
+                         type as `step1_arc_map`.
+
+   @return Returns the composed arc map. ans.NumAxes() == 2 and ans.Dim0()
+           equals to `step2_arc_map.Dim0()`. Suppose elements in row i of
+           `step2_arc_map` are [2, 3, 7], then the elements in row i of ans
+           will be the concatenation of elements in row 2, 3, 7 of
+           `step1_arc_map`.
+ */
+Ragged<int32_t> ComposeArcMaps(Ragged<int32_t> &step1_arc_map,
+                               Ragged<int32_t> &step2_arc_map);
+
+/*
+  This function detects if there are any FSAs in an FsaVec that have exactly one
+  state (which is not allowed; the empty FSA may have either 0 or 2 states); and
+  it removes those states.  These states cannot have any arcs leaving them; if
+  they do, it is an error and this function may crash or give undefined output.
+
+    @param [in,out] fsas  FsaVec to possibly modify; must have 3 axes.
+
+  CAUTION: this is not used right now and I'm not sure if there are any
+  situations where it really should be used; think carefully before using it.
+ */
+void FixNumStates(FsaVec *fsas);
+
 
 }  // namespace k2
 

@@ -34,13 +34,23 @@ struct Arc {
         label(label),
         score(score) {}
 
-  bool operator<(const Arc &other) const {
+  __host__ __device__ __forceinline__ bool operator==(const Arc &other) const {
+    return src_state == other.src_state && dest_state == other.dest_state &&
+           label == other.label && fabsf(score - other.score) < 1e-5;
+  }
+
+  __host__ __device__ __forceinline__ bool operator!=(const Arc &other) const {
+    return !(*this == other);
+  }
+
+  __host__ __device__ __forceinline__ bool operator<(const Arc &other) const {
     // Compares `label` first, then `dest_state`;
     // compare label as unsigned so -1 comes after other symbols, since some
     // algorithms may require epsilons to be first.
-    return std::tie(reinterpret_cast<const uint32_t &>(label), dest_state) <
-           std::tie(reinterpret_cast<const uint32_t &>(other.label),
-                    other.dest_state);
+    if (label != other.label)
+      return static_cast<uint32_t>(label) < static_cast<uint32_t>(other.label);
+    else
+      return dest_state < other.dest_state;
   }
 };
 
@@ -76,9 +86,9 @@ enum FsaBasicProperties {
                                          // co-accessible, i.e. states with no
                                          // arcs entering them
   kFsaPropertiesMaybeCoaccessible =
-      0x0100,                           // True if there are no obvious signs of
-                                        // states not being co-accessible, i.e.
-                                        // i.e. states with no arcs leaving them
+      0x0100,  // True if there are no obvious signs of
+               // states not being co-accessible, i.e.
+               // i.e. states with no arcs leaving them
   kFsaAllProperties = 0x01FF
 };
 
@@ -153,11 +163,17 @@ struct DenseFsaVec {
       : shape(shape), scores(scores) {
     K2_CHECK(IsCompatible(shape, scores));
     K2_CHECK_EQ(shape.NumElements(), scores.Dim0());
+    K2_CHECK_EQ(shape.NumAxes(), 2);
   }
-  ContextPtr Context() const { return shape.Context(); }
+  ContextPtr &Context() const { return shape.Context(); }
   DenseFsaVec To(ContextPtr c) const {
     return DenseFsaVec(shape.To(c), scores.To(c));
   }
+  /* Indexing operator that rearranges the sequences, analogous to: RaggedShape
+     Index(RaggedShape &src, const Array1<int32_t> &indexes).  Currently just
+     used for testing.
+   */
+  DenseFsaVec operator[](const Array1<int32_t> &indexes);
 };
 
 std::ostream &operator<<(std::ostream &os, const DenseFsaVec &dfsavec);
@@ -194,13 +210,17 @@ std::ostream &operator<<(std::ostream &os, const DenseFsaVec &dfsavec);
 */
 Fsa FsaFromTensor(Tensor &t, bool *error);
 
+
 Fsa FsaFromArray1(Array1<Arc> &arc, bool *error);
 
 /*
   Returns a single Tensor that represents the FSA; this is just the vector of
-  Arc reinterpreted as  num_arcs by 4 Tensor of int32_t.  It can be converted
-  back to an equivalent FSA using `FsaFromTensor`.  Notice: this is not the
-  same format as we use to serialize FsaVec.
+  Arc reinterpreted as a (num_arcs by 4) Tensor of int32_t.  It can be converted
+  back to an equivalent FSA using `FsaFromTensor`.  Notice: this is not the same
+  format as we use to serialize FsaVec.  Also the round-trip conversion to
+  Tensor and back may not preserve the number of states for FSAs that had no
+  arcs entering the final-state, since we have to guess the number of states in
+  this case.
 
   It is an error if `fsa.NumAxes() != 2`.
  */
@@ -259,8 +279,6 @@ Tensor FsaVecToTensor(const FsaVec &fsa_vec);
 
 */
 FsaVec FsaVecFromTensor(Tensor &t, bool *error);
-
-FsaVec FsaVecFromArray1(Array1<Arc> &arc, bool *error);  // TODO: implement it
 
 /*
   Return one Fsa in an FsaVec.  Note, this has to make copies of the

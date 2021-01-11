@@ -11,9 +11,15 @@
 
 #include <algorithm>
 
+#include "cub/cub.cuh"
+#include "k2/csrc/array_ops.h"
+#include "k2/csrc/macros.h"
 #include "k2/csrc/math.h"
+#include "k2/csrc/moderngpu_allocator.h"
 #include "k2/csrc/nvtx.h"
 #include "k2/csrc/utils.h"
+#include "moderngpu/kernel_load_balance.hxx"
+#include "moderngpu/kernel_sortedsearch.hxx"
 
 namespace k2 {
 
@@ -110,10 +116,10 @@ __global__ void RowSplitsToRowIdsKernel(int32_t num_rows,
        }
        x[orig_i] = x[i];
 */
-void RowSplitsToRowIds(ContextPtr &c, int32_t num_rows,
+void RowSplitsToRowIds(ContextPtr c, int32_t num_rows,
                        const int32_t *row_splits, int32_t num_elems,
                        int32_t *row_ids) {
-  NVTX_RANGE(__func__);
+  NVTX_RANGE(K2_FUNC);
   if (num_rows <= 0 || num_elems <= 0) return;
   DeviceType d = c->GetDeviceType();
   if (d == kCpu) {
@@ -128,6 +134,30 @@ void RowSplitsToRowIds(ContextPtr &c, int32_t num_rows,
   } else {
     K2_CHECK_EQ(d, kCuda);
     if (1) {
+#if 1
+      mgpu::context_t *mgpu_allocator = GetModernGpuAllocator(c);
+      mgpu::load_balance_search(num_elems, row_splits, num_rows, row_ids,
+                                *mgpu_allocator);
+#elif 0
+      auto lambda_set_minus_1 = [=] __device__(int32_t i) -> void {
+        row_ids[i] = -1;
+      };
+      EvalDevice(c, num_elems, lambda_set_minus_1);
+
+      auto lambda_set_row_ids_start = [=] __device__(int32_t i) -> void {
+        if (row_splits[i + 1] > row_splits[i]) row_ids[row_splits[i]] = i;
+      };
+      EvalDevice(c, num_rows, lambda_set_row_ids_start);
+
+      size_t temp_storage_bytes;
+      cub::DeviceScan::InclusiveScan(nullptr, temp_storage_bytes, row_ids,
+                                     row_ids, MaxOp<int32_t>(), num_elems,
+                                     c->GetCudaStream());
+      Array1<int8_t> d_temp_storage(c, temp_storage_bytes);
+      cub::DeviceScan::InclusiveScan(d_temp_storage.Data(), temp_storage_bytes,
+                                     row_ids, row_ids, MaxOp<int32_t>(),
+                                     num_elems, c->GetCudaStream());
+#else
       // TODO: compare this for speed with the other branch.  This is branch is
       // much simpler, and will be considerably faster for "normal" cases ->
       // probably preferred.
@@ -140,6 +170,7 @@ void RowSplitsToRowIds(ContextPtr &c, int32_t num_rows,
       K2_CUDA_SAFE_CALL(RowSplitsToRowIdsKernel<<<grid_size, block_size, 0,
                                                   c->GetCudaStream()>>>(
           num_rows, threads_per_row, row_splits, num_elems, row_ids));
+#endif
     } else {
       // TODO: Will probably just delete this branch at some point.
 
@@ -148,56 +179,55 @@ void RowSplitsToRowIds(ContextPtr &c, int32_t num_rows,
       // asymptotic time complexity (assuming all kernels run in parallel),
       // specifically: O(log(largest(row_splits[i+1]-row_splits[i])))
 
-      auto lambda_init_minus_one = [=] __host__ __device__(int32_t i) {
-        row_ids[i] = -1;
-      };
-      Eval(c, num_elems + 1, lambda_init_minus_one);
+      K2_EVAL(
+          c, num_elems + 1, lambda_init_minus_one,
+          (int32_t i)->void { row_ids[i] = -1; });
 
-      auto lambda_phase_one = [=] __host__ __device__(int32_t i) {
-        int32_t this_row_split = row_splits[i],
-                next_row_split =
-                    (i < num_rows ? row_splits[i + 1] : this_row_split + 1);
-        if (this_row_split < next_row_split) row_ids[this_row_split] = i;
-        // we have to fill in row_ids[this_row_split],
-        // row_ids[this_row_split+1]... row_ids[next_row_split-1] with the same
-        // value but that could be a long loop. Instead we write at
-        // this_row_split and all indexes this_row_split < i < next_row_split
-        // such that i is the result of rounding up this_row_split to
-        // (something)*2^n, for n = 1, 2, 3, ... this will take time logarithmic
-        // in (next_row_split - this_row_split). we can then fill in the gaps
-        // with a logarithmic-time loop, by looking for a value that's not (-1)
-        // by rounding the current index down to successively higher powers
-        // of 2.
-        for (int32_t power = 0, j = this_row_split;
-             j + (1 << power) < next_row_split; power++) {
-          if (j & (1 << power)) {
-            j += (1 << power);
-            // we know that j is now < next_row_split, because we checked "j +
-            // (1<<power) < next_row_split" in the loop condition.
-            // Note, we don't want a loop-within-a-loop because of how SIMT
-            // works...
-            row_ids[j] = i;
-          }
-        }
-      };
-      Eval(c, num_elems + 1, lambda_phase_one);
+      K2_EVAL(
+          c, num_elems + 1, lambda_phase_one, (int32_t i)->void {
+            int32_t this_row_split = row_splits[i],
+                    next_row_split =
+                        (i < num_rows ? row_splits[i + 1] : this_row_split + 1);
+            if (this_row_split < next_row_split) row_ids[this_row_split] = i;
+            // we have to fill in row_ids[this_row_split],
+            // row_ids[this_row_split+1]... row_ids[next_row_split-1] with the
+            // same value but that could be a long loop. Instead we write at
+            // this_row_split and all indexes this_row_split < i <
+            // next_row_split such that i is the result of rounding up
+            // this_row_split to (something)*2^n, for n = 1, 2, 3, ... this will
+            // take time logarithmic in (next_row_split - this_row_split). we
+            // can then fill in the gaps with a logarithmic-time loop, by
+            // looking for a value that's not (-1) by rounding the current index
+            // down to successively higher powers of 2.
+            for (int32_t power = 0, j = this_row_split;
+                 j + (1 << power) < next_row_split; power++) {
+              if (j & (1 << power)) {
+                j += (1 << power);
+                // we know that j is now < next_row_split, because we checked "j
+                // + (1<<power) < next_row_split" in the loop condition. Note,
+                // we don't want a loop-within-a-loop because of how SIMT
+                // works...
+                row_ids[j] = i;
+              }
+            }
+          });
 
-      auto lambda_phase_two = [=] __host__ __device__(int32_t j) {
-        int32_t row_index = row_ids[j];
-        if (row_index != -1) return;
-        int32_t power = 0, j2 = j;
-        for (; row_index != -1; power++) {
-          if (j2 & (1 << power)) {
-            j2 -= (1 << power);
-            row_index = row_ids[j2];
-          }
-          assert(power < 31);
-        }
-        row_ids[j] = row_ids[j2];
-      };
       // could do the next line for num_elems+1, but the element at `num_elems`
       // will already be set.
-      Eval(c, num_elems, lambda_phase_two);
+      K2_EVAL(
+          c, num_elems, lambda_phase_two, (int32_t j)->void {
+            int32_t row_index = row_ids[j];
+            if (row_index != -1) return;
+            int32_t power = 0, j2 = j;
+            for (; row_index != -1; power++) {
+              if (j2 & (1 << power)) {
+                j2 -= (1 << power);
+                row_index = row_ids[j2];
+              }
+              assert(power < 31);
+            }
+            row_ids[j] = row_ids[j2];
+          });
     }
   }
 }
@@ -266,16 +296,15 @@ __global__ void RowIdsToRowSplitsKernel(int32_t num_elems,
 }
 
 // see declaration in utils.h for documentation.
-void RowIdsToRowSplits(ContextPtr &c, int32_t num_elems, const int32_t *row_ids,
+void RowIdsToRowSplits(ContextPtr c, int32_t num_elems, const int32_t *row_ids,
                        bool no_empty_rows, int32_t num_rows,
                        int32_t *row_splits) {
-  NVTX_RANGE(__func__);
+  NVTX_RANGE(K2_FUNC);
   // process corner case first
   if (num_elems == 0) {
-    auto lambda_set_values = [=] __host__ __device__(int32_t i) {
-      row_splits[i] = 0;
-    };
-    Eval(c, num_rows + 1, lambda_set_values);
+    K2_EVAL(
+        c, num_rows + 1, lambda_set_values,
+        (int32_t i)->void { row_splits[i] = 0; });
     return;
   }
   DeviceType d = c->GetDeviceType();
@@ -296,8 +325,26 @@ void RowIdsToRowSplits(ContextPtr &c, int32_t num_elems, const int32_t *row_ids,
     }
   } else {
     K2_CHECK_EQ(d, kCuda);
+#if 1
+    // moderngpu is faster
+    auto lambda_set_row_splits = [=] __device__(int32_t i) {
+      if (i == num_rows)
+        row_splits[i] = num_elems;
+      else
+        row_splits[i] = i;
+    };
+    EvalDevice(c, num_rows + 1, lambda_set_row_splits);
+
+    mgpu::context_t *mgpu_allocator = GetModernGpuAllocator(c);
+    mgpu::sorted_search<mgpu::bounds_lower>(
+        row_splits, num_rows, row_ids, num_elems, row_splits,
+        LessThan<int32_t>(), *mgpu_allocator);
+#elif 0
+    Array1<int32_t> counts = GetCounts(c, row_ids, num_elems, num_rows + 1);
+    ExclusiveSum(c, num_rows + 1, counts.Data(), row_splits);
+#else
     if (no_empty_rows) {
-      auto lambda_simple = [=] __host__ __device__(int32_t i) {
+      auto lambda_simple = [=] __device__(int32_t i) {
         int32_t this_row = row_ids[i], prev_row;
         if (i > 0) {
           // (normal case)
@@ -313,7 +360,7 @@ void RowIdsToRowSplits(ContextPtr &c, int32_t num_elems, const int32_t *row_ids,
           row_splits[this_row] = i;
         }
       };
-      Eval(c, num_elems, lambda_simple);
+      EvalDevice(c, num_elems, lambda_simple);
       return;
     } else {
       // By doing "+ 2" instead of "+ 1" we increase the minimum number of
@@ -329,6 +376,7 @@ void RowIdsToRowSplits(ContextPtr &c, int32_t num_elems, const int32_t *row_ids,
                                                   c->GetCudaStream()>>>(
           num_elems, threads_per_elem, row_ids, num_rows, row_splits));
     }
+#endif
   }
 }
 
@@ -564,7 +612,7 @@ __global__ void GetTaskRedirect(int32_t num_tasks, const int32_t *row_splits,
 
 void GetTaskRedirect(cudaStream_t stream, int32_t num_tasks,
                      const int32_t *row_splits, TaskRedirect *redirect_out) {
-  NVTX_RANGE(__func__);
+  NVTX_RANGE(K2_FUNC);
   if (num_tasks <= 0) return;
   if (stream == kCudaStreamInvalid) {
     // there's not much point in using this on CPU as there are better ways
